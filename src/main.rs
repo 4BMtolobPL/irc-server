@@ -21,6 +21,50 @@ struct Client {
     sender: mpsc::Sender<String>,
 }
 
+#[derive(Debug)]
+enum Command {
+    Nick(String),
+    User { username: String, realname: String },
+    Ping(String),
+    Pong(String),
+    Quit,
+    Unknown(String),
+}
+
+fn parse_command(line: &str) -> Command {
+    let mut parts = line.splitn(2, ' ');
+
+    let command = parts.next().unwrap_or("").to_uppercase();
+    let rest = parts.next().unwrap_or("").trim();
+
+    match command.as_str() {
+        "NICK" => Command::Nick(rest.to_string()),
+        "USER" => {
+            let mut parts = rest.splitn(4, ' ');
+
+            let username = parts.next().unwrap_or("").to_string();
+
+            // hostname
+            let _ = parts.next();
+
+            // servername
+            let _ = parts.next();
+
+            let realname = parts
+                .next()
+                .unwrap_or("")
+                .trim_start_matches(':')
+                .to_string();
+
+            Command::User { username, realname }
+        }
+        "PING" => Command::Ping(rest.trim_start_matches(':').to_string()),
+        "PONG" => Command::Pong(rest.trim_start_matches(':').to_string()),
+        "QUIT" => Command::Quit,
+        _ => Command::Unknown(line.to_string()),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let listen_addr = "0.0.0.0:6667";
@@ -78,7 +122,14 @@ async fn handle_client(
         let mut lines = reader.lines();
 
         while let Some(line) = lines.next_line().await? {
-            println!("[{client_id}] {line}");
+            let command = parse_command(&line);
+
+            let should_continue =
+                handle_command(command, client_id, Arc::clone(&server), &sender).await?;
+
+            if !should_continue {
+                break;
+            }
         }
 
         Ok::<(), Box<dyn std::error::Error>>(())
@@ -109,4 +160,74 @@ async fn handle_client(
     println!("Client {client_id} disconnected");
 
     Ok(())
+}
+
+async fn handle_command(
+    command: Command,
+    client_id: ClientId,
+    server: Arc<RwLock<Server>>,
+    sender: &mpsc::Sender<String>,
+) -> Result<bool> {
+    match command {
+        Command::Nick(nickname) => handle_nick(client_id, &nickname, server).await?,
+        Command::User { username, realname } => {
+            println!("[{client_id}] USER username={username}, realname={realname}")
+        }
+        Command::Ping(token) => sender.send(format!("PONG :{token}")).await?,
+        Command::Pong(token) => println!("[{client_id}] PONG {token}"),
+        Command::Quit => return Ok(false),
+        Command::Unknown(command) => println!("[{client_id}] Unknown command: {command}"),
+    }
+
+    Ok(true)
+}
+
+async fn handle_nick(
+    client_id: ClientId,
+    nickname: &str,
+    server: Arc<RwLock<Server>>,
+) -> Result<()> {
+    let mut server = server.write().await;
+
+    if server
+        .clients
+        .values()
+        .any(|client| client.nickname.as_deref() == Some(nickname))
+    {
+        return Ok(());
+    }
+
+    if let Some(client) = server.clients.get_mut(&client_id) {
+        client.nickname = Some(nickname.to_string());
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::assert_matches;
+
+    use super::*;
+
+    #[test]
+    fn parse_nick() {
+        let command = parse_command("NICK alice");
+
+        assert_matches!(command, Command::Nick(nickname) if nickname == "alice");
+    }
+
+    #[test]
+    fn parse_ping() {
+        let command = parse_command("PING :12345");
+
+        assert_matches!(command, Command::Ping(token) if token == "12345")
+    }
+
+    #[test]
+    fn parse_user() {
+        let command = parse_command("USER alice 0 * :Alice Smith");
+
+        assert_matches!(command, Command::User { username, realname } if username == "alice" && realname == "Alice Smith")
+    }
 }
