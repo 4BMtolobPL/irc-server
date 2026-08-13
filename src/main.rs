@@ -9,6 +9,11 @@ use tokio::{
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 type ClientId = u64;
 
+const ERR_NONICKNAMEGIVEN: &str = "431";
+const ERR_ERRONEUSNICKNAME: &str = "432";
+const ERR_NICKNAMEINUSE: &str = "433";
+const SERVER_NAME: &str = "server";
+
 #[derive(Debug, Default)]
 struct Server {
     clients: HashMap<ClientId, Client>,
@@ -169,7 +174,7 @@ async fn handle_command(
     sender: &mpsc::Sender<String>,
 ) -> Result<bool> {
     match command {
-        Command::Nick(nickname) => handle_nick(client_id, &nickname, server).await?,
+        Command::Nick(nickname) => handle_nick(client_id, &nickname, server, sender).await?,
         Command::User { username, realname } => {
             println!("[{client_id}] USER username={username}, realname={realname}")
         }
@@ -186,22 +191,77 @@ async fn handle_nick(
     client_id: ClientId,
     nickname: &str,
     server: Arc<RwLock<Server>>,
+    sender: &mpsc::Sender<String>,
 ) -> Result<()> {
-    let mut server = server.write().await;
+    if nickname.is_empty() {
+        sender
+            .send(format!(
+                ":{SERVER_NAME} {ERR_NONICKNAMEGIVEN} * :No nickname given"
+            ))
+            .await?;
 
-    if server
-        .clients
-        .values()
-        .any(|client| client.nickname.as_deref() == Some(nickname))
-    {
         return Ok(());
     }
 
-    if let Some(client) = server.clients.get_mut(&client_id) {
-        client.nickname = Some(nickname.to_string());
+    if !is_valid_nickname(nickname) {
+        sender
+            .send(format!(
+                ":{SERVER_NAME} {ERR_ERRONEUSNICKNAME} * {nickname} :Erroneous nickname"
+            ))
+            .await?;
+
+        return Ok(());
+    }
+
+    let nickname_in_use = {
+        let mut server = server.write().await;
+
+        let nickname_in_use = server
+            .clients
+            .iter()
+            .any(|(id, client)| *id != client_id && client.nickname.as_deref() == Some(nickname));
+
+        if !nickname_in_use {
+            let client = server
+                .clients
+                .get_mut(&client_id)
+                .ok_or("Client not found")?;
+
+            client.nickname = Some(nickname.to_string());
+        }
+
+        nickname_in_use
+    };
+
+    if nickname_in_use {
+        sender
+            .send(format!(
+                ":{SERVER_NAME} {ERR_NICKNAMEINUSE} * {nickname} :Nickname is already in use"
+            ))
+            .await?;
     }
 
     Ok(())
+}
+
+/// 첫글자: A-Za-z, IRC special character
+/// 나머지: A-Za-z0-9, IRC special character
+fn is_valid_nickname(nickname: &str) -> bool {
+    if nickname.is_empty() || nickname.len() > 30 {
+        return false;
+    }
+
+    let mut chars = nickname.chars();
+
+    let Some(first) = chars.next() else {
+        return false;
+    };
+
+    if !first.is_ascii_alphabetic() && !"-[]\\`^{}|".contains(first) {
+        return false;
+    }
+
+    chars.all(|c| c.is_ascii_alphanumeric() || "-[]\\`^{}|".contains(c))
 }
 
 #[cfg(test)]
@@ -229,5 +289,33 @@ mod tests {
         let command = parse_command("USER alice 0 * :Alice Smith");
 
         assert_matches!(command, Command::User { username, realname } if username == "alice" && realname == "Alice Smith")
+    }
+
+    #[test]
+    fn valid_nickname() {
+        assert!(is_valid_nickname("alice"));
+        assert!(is_valid_nickname("Alice123"));
+    }
+
+    #[test]
+    fn invalid_nickname() {
+        assert!(!is_valid_nickname(""));
+        assert!(!is_valid_nickname("alice!"));
+        assert!(!is_valid_nickname("alice bob"));
+        assert!(!is_valid_nickname("123alice"));
+    }
+
+    #[test]
+    fn valid_nickname_with_special_character() {
+        assert!(is_valid_nickname("[alice]"));
+        assert!(is_valid_nickname("alice|"));
+        assert!(is_valid_nickname("^alice"));
+    }
+
+    #[test]
+    fn invalid_nickname_too_long() {
+        let nickname = "a".repeat(31);
+
+        assert!(!is_valid_nickname(&nickname));
     }
 }
