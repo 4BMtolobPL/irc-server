@@ -9,6 +9,8 @@ use tokio::{
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 type ClientId = u64;
 
+const RPL_WELCOME: &str = "001";
+
 const ERR_NONICKNAMEGIVEN: &str = "431";
 const ERR_ERRONEUSNICKNAME: &str = "432";
 const ERR_NICKNAMEINUSE: &str = "433";
@@ -23,7 +25,24 @@ struct Server {
 struct Client {
     nickname: Option<String>,
     username: Option<String>,
+    realname: Option<String>,
     sender: mpsc::Sender<String>,
+}
+
+impl Client {
+    fn new(sender: mpsc::Sender<String>) -> Self {
+        Self {
+            nickname: None,
+            username: None,
+            realname: None,
+            sender,
+        }
+    }
+
+    /// NICK + USER -> registration
+    fn is_registered(&self) -> bool {
+        self.nickname.is_some() && self.username.is_some()
+    }
 }
 
 #[derive(Debug)]
@@ -34,6 +53,12 @@ enum Command {
     Pong(String),
     Quit,
     Unknown(String),
+}
+
+#[derive(Debug)]
+enum NickResult {
+    Changed { registered_nickname: Option<String> },
+    NicknameInUse,
 }
 
 fn parse_command(line: &str) -> Command {
@@ -110,14 +135,9 @@ async fn handle_client(
     {
         let mut server = server.write().await;
 
-        server.clients.insert(
-            client_id,
-            Client {
-                nickname: None,
-                username: None,
-                sender: sender.clone(),
-            },
-        );
+        server
+            .clients
+            .insert(client_id, Client::new(sender.clone()));
     }
 
     sender.send("Welcome to my IRC server!".to_string()).await?;
@@ -176,7 +196,7 @@ async fn handle_command(
     match command {
         Command::Nick(nickname) => handle_nick(client_id, &nickname, server, sender).await?,
         Command::User { username, realname } => {
-            println!("[{client_id}] USER username={username}, realname={realname}")
+            handle_user(client_id, &username, &realname, server, sender).await?
         }
         Command::Ping(token) => sender.send(format!("PONG :{token}")).await?,
         Command::Pong(token) => println!("[{client_id}] PONG {token}"),
@@ -213,7 +233,7 @@ async fn handle_nick(
         return Ok(());
     }
 
-    let nickname_in_use = {
+    let result = {
         let mut server = server.write().await;
 
         let nickname_in_use = server
@@ -221,22 +241,76 @@ async fn handle_nick(
             .iter()
             .any(|(id, client)| *id != client_id && client.nickname.as_deref() == Some(nickname));
 
-        if !nickname_in_use {
+        if nickname_in_use {
+            NickResult::NicknameInUse
+        } else {
             let client = server
                 .clients
                 .get_mut(&client_id)
                 .ok_or("Client not found")?;
 
-            client.nickname = Some(nickname.to_string());
-        }
+            let was_registered = client.is_registered();
 
-        nickname_in_use
+            client.nickname = Some(nickname.to_string());
+
+            NickResult::Changed {
+                registered_nickname: registration_complete(client, was_registered),
+            }
+        }
     };
 
-    if nickname_in_use {
+    match result {
+        NickResult::Changed {
+            registered_nickname: Some(nickname),
+        } => {
+            sender
+                .send(format!(
+                    ":{SERVER_NAME} {RPL_WELCOME} {nickname} :Welcome to the IRC server"
+                ))
+                .await?
+        }
+        NickResult::Changed {
+            registered_nickname: None,
+        } => {}
+        NickResult::NicknameInUse => {
+            sender
+                .send(format!(
+                    ":{SERVER_NAME} {ERR_NICKNAMEINUSE} * {nickname} :Nickname is already in use"
+                ))
+                .await?
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_user(
+    client_id: ClientId,
+    username: &str,
+    realname: &str,
+    server: Arc<RwLock<Server>>,
+    sender: &mpsc::Sender<String>,
+) -> Result<()> {
+    let registered_nickname = {
+        let mut server = server.write().await;
+
+        let client = server
+            .clients
+            .get_mut(&client_id)
+            .ok_or("Client not found")?;
+
+        let was_registered = client.is_registered();
+
+        client.username = Some(username.to_string());
+        client.realname = Some(realname.to_string());
+
+        registration_complete(client, was_registered)
+    };
+
+    if let Some(nickname) = registered_nickname {
         sender
             .send(format!(
-                ":{SERVER_NAME} {ERR_NICKNAMEINUSE} * {nickname} :Nickname is already in use"
+                ":{SERVER_NAME} {RPL_WELCOME} {nickname} :Welcome to the IRC server"
             ))
             .await?;
     }
@@ -262,6 +336,14 @@ fn is_valid_nickname(nickname: &str) -> bool {
     }
 
     chars.all(|c| c.is_ascii_alphanumeric() || "-[]\\`^{}|".contains(c))
+}
+
+fn registration_complete(client: &Client, was_registered: bool) -> Option<String> {
+    if !was_registered && client.is_registered() {
+        client.nickname.clone()
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -292,6 +374,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_command_is_case_insensitive() {
+        let command = parse_command("ping :12345");
+
+        assert_matches!(command, Command::Ping(token) if token == "12345");
+    }
+
+    #[test]
     fn valid_nickname() {
         assert!(is_valid_nickname("alice"));
         assert!(is_valid_nickname("Alice123"));
@@ -317,5 +406,42 @@ mod tests {
         let nickname = "a".repeat(31);
 
         assert!(!is_valid_nickname(&nickname));
+    }
+
+    #[test]
+    fn registration_is_completed_after_nick_and_user() {
+        let (sender, _) = mpsc::channel(1);
+        let mut client = Client::new(sender);
+
+        assert!(!client.is_registered());
+
+        client.nickname = Some("alice".to_string());
+        assert!(!client.is_registered());
+
+        let was_registered = client.is_registered();
+
+        client.username = Some("alice".to_string());
+
+        let nickname = registration_complete(&client, was_registered);
+
+        assert_eq!(nickname, Some("alice".to_string()));
+        assert!(client.is_registered());
+    }
+
+    #[test]
+    fn registration_is_not_completed_twice() {
+        let (sender, _) = mpsc::channel(1);
+
+        let mut client = Client::new(sender);
+        client.nickname = Some("alice".to_string());
+        client.username = Some("alice".to_string());
+
+        let was_registered = client.is_registered();
+
+        client.nickname = Some("bob".to_string());
+
+        let nickname = registration_complete(&client, was_registered);
+
+        assert_eq!(nickname, None);
     }
 }
