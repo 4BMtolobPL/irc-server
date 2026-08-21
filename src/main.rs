@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -11,6 +14,19 @@ type ClientId = u64;
 
 const RPL_WELCOME: &str = "001";
 
+// const RPL_TOPIC: &str = "332";
+// const RPL_TOPICTIME: &str = "333";
+// const RPL_NAMREPLY: &str = "353";
+
+const ERR_NOSUCHCHANNEL: &str = "403";
+// const ERR_TOOMANYCHANNELS: &str = "405";
+const ERR_NOTONCHANNEL: &str = "442";
+// const ERR_NEEDMOREPARAMS: &str = "461";
+// const ERR_CHANNELISFULL: &str = "471";
+// const ERR_INVITEONLYCHAN: &str = "473";
+// const ERR_BANNEDFROMCHAN: &str = "474";
+// const ERR_BADCHANNELKEY: &str = "475";
+
 const ERR_NONICKNAMEGIVEN: &str = "431";
 const ERR_ERRONEUSNICKNAME: &str = "432";
 const ERR_NICKNAMEINUSE: &str = "433";
@@ -19,6 +35,20 @@ const SERVER_NAME: &str = "server";
 #[derive(Debug, Default)]
 struct Server {
     clients: HashMap<ClientId, Client>,
+    channels: HashMap<String, Channel>,
+}
+
+impl Server {
+    fn remove_client(&mut self, client_id: ClientId) {
+        self.clients.remove(&client_id);
+
+        for channel in self.channels.values_mut() {
+            channel.members.remove(&client_id);
+        }
+
+        self.channels
+            .retain(|_, channel| !channel.members.is_empty());
+    }
 }
 
 #[derive(Debug)]
@@ -46,9 +76,26 @@ impl Client {
 }
 
 #[derive(Debug)]
+struct Channel {
+    name: String,
+    members: HashSet<ClientId>,
+}
+
+impl Channel {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            members: HashSet::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
 enum Command {
     Nick(String),
     User { username: String, realname: String },
+    Join(String),
+    Part(String),
     Ping(String),
     Pong(String),
     Quit,
@@ -59,6 +106,20 @@ enum Command {
 enum NickResult {
     Changed { registered_nickname: Option<String> },
     NicknameInUse,
+}
+
+#[derive(Debug)]
+enum PartResult {
+    Parted {
+        nickname: String,
+        senders: Vec<mpsc::Sender<String>>,
+    },
+    NotOnChannel {
+        nickname: String,
+    },
+    NoSuchChannel {
+        nickname: String,
+    },
 }
 
 fn parse_command(line: &str) -> Command {
@@ -88,6 +149,8 @@ fn parse_command(line: &str) -> Command {
 
             Command::User { username, realname }
         }
+        "JOIN" => Command::Join(rest.to_string()),
+        "PART" => Command::Part(rest.to_string()),
         "PING" => Command::Ping(rest.trim_start_matches(':').to_string()),
         "PONG" => Command::Pong(rest.trim_start_matches(':').to_string()),
         "QUIT" => Command::Quit,
@@ -180,8 +243,9 @@ async fn handle_client(
 
     {
         let mut server = server.write().await;
-        server.clients.remove(&client_id);
+        server.remove_client(client_id);
     }
+
     println!("Client {client_id} disconnected");
 
     Ok(())
@@ -198,6 +262,8 @@ async fn handle_command(
         Command::User { username, realname } => {
             handle_user(client_id, &username, &realname, server, sender).await?
         }
+        Command::Join(channel) => handle_join(client_id, &channel, server, sender).await?,
+        Command::Part(channel) => handle_part(client_id, &channel, server, sender).await?,
         Command::Ping(token) => sender.send(format!("PONG :{token}")).await?,
         Command::Pong(token) => println!("[{client_id}] PONG {token}"),
         Command::Quit => return Ok(false),
@@ -318,6 +384,144 @@ async fn handle_user(
     Ok(())
 }
 
+async fn handle_join(
+    client_id: ClientId,
+    channel_name: &str,
+    server: Arc<RwLock<Server>>,
+    sender: &mpsc::Sender<String>,
+) -> Result<()> {
+    if !is_valid_channel_name(channel_name) {
+        sender
+            .send(format!(
+                ":{SERVER_NAME} {ERR_NOSUCHCHANNEL} * {channel_name} :No such channel"
+            ))
+            .await?;
+
+        return Ok(());
+    }
+
+    let (nickname, senders) = {
+        let mut server = server.write().await;
+
+        let nickname = server
+            .clients
+            .get(&client_id)
+            .filter(|client| client.is_registered())
+            .and_then(|client| client.nickname.clone())
+            .ok_or("Client is not registered")?;
+
+        let member_ids: Vec<u64> = {
+            let channel = server
+                .channels
+                .entry(channel_name.to_string())
+                .or_insert_with(|| Channel::new(channel_name.to_string()));
+
+            let inserted = channel.members.insert(client_id);
+
+            if !inserted {
+                return Ok(());
+            }
+
+            channel.members.iter().copied().collect()
+        };
+
+        let senders: Vec<mpsc::Sender<String>> = member_ids
+            .iter()
+            .filter_map(|member_id| {
+                server
+                    .clients
+                    .get(member_id)
+                    .map(|client| client.sender.clone())
+            })
+            .collect();
+
+        (nickname, senders)
+    };
+
+    let message = format!(":{nickname} JOIN {channel_name}");
+
+    for sender in senders {
+        sender.send(message.clone()).await?;
+    }
+
+    Ok(())
+}
+
+async fn handle_part(
+    client_id: ClientId,
+    channel_name: &str,
+    server: Arc<RwLock<Server>>,
+    sender: &mpsc::Sender<String>,
+) -> Result<()> {
+    if !is_valid_channel_name(channel_name) {
+        sender
+            .send(format!(
+                ":{SERVER_NAME} {ERR_NOSUCHCHANNEL} * {channel_name} :No such channel"
+            ))
+            .await?;
+
+        return Ok(());
+    }
+
+    let result = {
+        let mut server = server.write().await;
+
+        let nickname = server
+            .clients
+            .get(&client_id)
+            .filter(|client| client.is_registered())
+            .and_then(|client| client.nickname.clone())
+            .ok_or("Client is not registered")?;
+
+        // 채널 존재 여부 확인
+        if let Some(channel) = server.channels.get_mut(channel_name) {
+            let is_on_channel = channel.members.remove(&client_id);
+    
+            // 멤버 part 및 ID 수집
+            if is_on_channel {
+                let member_ids: Vec<ClientId> = channel.members.iter().copied().collect();
+                let is_empty = channel.members.is_empty();
+                // 여기서 channel의 reference 사용 종료
+    
+                let senders: Vec<mpsc::Sender<String>> = member_ids
+                    .iter()
+                    .filter_map(|member_id| {
+                        server
+                            .clients
+                            .get(member_id)
+                            .map(|client| client.sender.clone())
+                    })
+                    .collect();
+    
+                // 채널이 비어있으면 server.channels에서 제거
+                if is_empty {
+                    server.channels.remove(channel_name);
+                }
+    
+                PartResult::Parted { nickname, senders }
+            } else {
+                PartResult::NotOnChannel { nickname }
+            }
+        } else {
+            PartResult::NoSuchChannel { nickname }
+        }
+    };
+
+    match result {
+        PartResult::Parted { nickname, senders } => {
+            let message = format!(":{nickname} PART {channel_name}");
+
+            for sender in senders {
+                sender.send(message.clone()).await?;
+            }
+        },
+        PartResult::NotOnChannel { nickname } => sender.send(format!(":{SERVER_NAME} {ERR_NOTONCHANNEL} {nickname} {channel_name} :You're not on that channel")).await?,
+        PartResult::NoSuchChannel { nickname } => sender.send(format!(":{SERVER_NAME} {ERR_NOSUCHCHANNEL} {nickname} {channel_name} :No such channel")).await?,
+    }
+
+    Ok(())
+}
+
 /// 첫글자: A-Za-z, IRC special character
 /// 나머지: A-Za-z0-9, IRC special character
 fn is_valid_nickname(nickname: &str) -> bool {
@@ -346,6 +550,20 @@ fn registration_complete(client: &Client, was_registered: bool) -> Option<String
     }
 }
 
+fn is_valid_channel_name(channel_name: &str) -> bool {
+    if channel_name.len() <= 1 || channel_name.len() > 50 {
+        return false;
+    }
+
+    if !channel_name.starts_with('#') {
+        return false;
+    }
+
+    !channel_name
+        .chars()
+        .any(|c| c == ' ' || c == ',' || c == '\0')
+}
+
 #[cfg(test)]
 mod tests {
     use std::assert_matches;
@@ -360,17 +578,31 @@ mod tests {
     }
 
     #[test]
-    fn parse_ping() {
-        let command = parse_command("PING :12345");
-
-        assert_matches!(command, Command::Ping(token) if token == "12345")
-    }
-
-    #[test]
     fn parse_user() {
         let command = parse_command("USER alice 0 * :Alice Smith");
 
         assert_matches!(command, Command::User { username, realname } if username == "alice" && realname == "Alice Smith")
+    }
+
+    #[test]
+    fn parse_join() {
+        let command = parse_command("JOIN #rust");
+
+        assert_matches!(command, Command::Join(channel) if channel == "#rust");
+    }
+
+    #[test]
+    fn parse_part() {
+        let command = parse_command("PART #rust");
+
+        assert_matches!(command, Command::Part(channel) if channel == "#rust");
+    }
+
+    #[test]
+    fn parse_ping() {
+        let command = parse_command("PING :12345");
+
+        assert_matches!(command, Command::Ping(token) if token == "12345")
     }
 
     #[test]
@@ -409,6 +641,37 @@ mod tests {
     }
 
     #[test]
+    fn valid_channel_name() {
+        assert!(is_valid_channel_name("#rust"));
+        assert!(is_valid_channel_name("#general"));
+        assert!(is_valid_channel_name("#rust123"));
+    }
+
+    #[test]
+    fn invalid_channel_name() {
+        assert!(!is_valid_channel_name(""));
+        assert!(!is_valid_channel_name("#"));
+        assert!(!is_valid_channel_name("rust"));
+        assert!(!is_valid_channel_name("#rust chat"));
+        assert!(!is_valid_channel_name("#rust,chat"));
+        assert!(!is_valid_channel_name("#rust\0"));
+    }
+
+    #[test]
+    fn channel_name_max_length_is_valid() {
+        let channel_name = format!("#{}", "a".repeat(49));
+
+        assert!(is_valid_channel_name(&channel_name));
+    }
+
+    #[test]
+    fn invalid_channel_name_too_long() {
+        let channel_name = format!("#{}", "a".repeat(50));
+
+        assert!(!is_valid_channel_name(&channel_name));
+    }
+
+    #[test]
     fn registration_is_completed_after_nick_and_user() {
         let (sender, _) = mpsc::channel(1);
         let mut client = Client::new(sender);
@@ -443,5 +706,74 @@ mod tests {
         let nickname = registration_complete(&client, was_registered);
 
         assert_eq!(nickname, None);
+    }
+
+    #[test]
+    fn remove_client_removes_client_from_channels() {
+        let (sender, _) = mpsc::channel(1);
+
+        let mut server = Server::default();
+
+        server.clients.insert(1, Client::new(sender));
+
+        let mut rust = Channel::new("#rust".to_string());
+        rust.members.insert(1);
+        rust.members.insert(2);
+
+        let mut general = Channel::new("#general".to_string());
+        general.members.insert(1);
+        general.members.insert(3);
+
+        server.channels.insert("#rust".to_string(), rust);
+        server.channels.insert("#general".to_string(), general);
+
+        server.remove_client(1);
+
+        assert!(!server.clients.contains_key(&1));
+
+        assert!(!server.channels["#rust"].members.contains(&1));
+        assert!(server.channels["#rust"].members.contains(&2));
+
+        assert!(!server.channels["#general"].members.contains(&1));
+        assert!(server.channels["#general"].members.contains(&3));
+    }
+
+    #[test]
+    fn remove_client_removes_empty_channels() {
+        let (sender, _) = mpsc::channel(1);
+
+        let mut server = Server::default();
+
+        server.clients.insert(1, Client::new(sender));
+
+        let mut channel = Channel::new("#rust".to_string());
+        channel.members.insert(1);
+
+        server.channels.insert("#rust".to_string(), channel);
+
+        server.remove_client(1);
+
+        assert!(!server.clients.contains_key(&1));
+        assert!(!server.channels.contains_key("#rust"));
+    }
+
+    #[test]
+    fn remove_client_keeps_non_empty_channels() {
+        let (sender, _) = mpsc::channel(1);
+
+        let mut server = Server::default();
+
+        server.clients.insert(1, Client::new(sender));
+
+        let mut channel = Channel::new("#rust".to_string());
+        channel.members.insert(1);
+        channel.members.insert(2);
+
+        server.channels.insert("#rust".to_string(), channel);
+
+        server.remove_client(1);
+
+        assert!(server.channels.contains_key("#rust"));
+        assert_eq!(server.channels["#rust"].members, HashSet::from([2]));
     }
 }
