@@ -39,7 +39,35 @@ struct Server {
 }
 
 impl Server {
-    fn remove_client(&mut self, client_id: ClientId) {
+    fn disconnect_client(&mut self, client_id: ClientId) -> DisconnectResult {
+        let nickname = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.nickname.clone());
+
+        let mut member_ids = HashSet::new();
+
+        for channel in self.channels.values() {
+            if channel.members.contains(&client_id) {
+                member_ids.extend(
+                    channel
+                        .members
+                        .iter()
+                        .filter(|member_id| **member_id != client_id)
+                        .copied(),
+                );
+            }
+        }
+
+        let senders: Vec<mpsc::Sender<String>> = member_ids
+            .iter()
+            .filter_map(|member_id| {
+                self.clients
+                    .get(member_id)
+                    .map(|client| client.sender.clone())
+            })
+            .collect();
+
         self.clients.remove(&client_id);
 
         for channel in self.channels.values_mut() {
@@ -48,6 +76,8 @@ impl Server {
 
         self.channels
             .retain(|_, channel| !channel.members.is_empty());
+
+        DisconnectResult { nickname, senders }
     }
 }
 
@@ -120,6 +150,12 @@ enum PartResult {
     NoSuchChannel {
         nickname: String,
     },
+}
+
+#[derive(Debug)]
+struct DisconnectResult {
+    nickname: Option<String>,
+    senders: Vec<mpsc::Sender<String>>,
 }
 
 fn parse_command(line: &str) -> Command {
@@ -242,8 +278,18 @@ async fn handle_client(
     }
 
     {
-        let mut server = server.write().await;
-        server.remove_client(client_id);
+        let result = {
+            let mut server = server.write().await;
+            server.disconnect_client(client_id)
+        };
+
+        if let Some(nickname) = result.nickname {
+            let message = format!(":{nickname} QUIT :Client Quit");
+
+            for sender in result.senders {
+                sender.send(message.clone()).await?;
+            }
+        }
     }
 
     println!("Client {client_id} disconnected");
@@ -473,16 +519,16 @@ async fn handle_part(
             .and_then(|client| client.nickname.clone())
             .ok_or("Client is not registered")?;
 
-        // 채널 존재 여부 확인
-        if let Some(channel) = server.channels.get_mut(channel_name) {
-            let is_on_channel = channel.members.remove(&client_id);
-    
-            // 멤버 part 및 ID 수집
-            if is_on_channel {
-                let member_ids: Vec<ClientId> = channel.members.iter().copied().collect();
-                let is_empty = channel.members.is_empty();
-                // 여기서 channel의 reference 사용 종료
-    
+        let member_ids: Option<Vec<ClientId>> = server
+            .channels
+            .get(channel_name)
+            .map(|channel| channel.members.iter().copied().collect());
+
+        match member_ids {
+            Some(member_ids) if !member_ids.contains(&client_id) => {
+                PartResult::NotOnChannel { nickname }
+            }
+            Some(member_ids) => {
                 let senders: Vec<mpsc::Sender<String>> = member_ids
                     .iter()
                     .filter_map(|member_id| {
@@ -492,18 +538,18 @@ async fn handle_part(
                             .map(|client| client.sender.clone())
                     })
                     .collect();
-    
-                // 채널이 비어있으면 server.channels에서 제거
-                if is_empty {
-                    server.channels.remove(channel_name);
+
+                if let Some(channel) = server.channels.get_mut(channel_name) {
+                    channel.members.remove(&client_id);
+
+                    if channel.members.is_empty() {
+                        server.channels.remove(channel_name);
+                    }
                 }
-    
+
                 PartResult::Parted { nickname, senders }
-            } else {
-                PartResult::NotOnChannel { nickname }
             }
-        } else {
-            PartResult::NoSuchChannel { nickname }
+            None => PartResult::NoSuchChannel { nickname },
         }
     };
 
@@ -709,37 +755,60 @@ mod tests {
     }
 
     #[test]
-    fn remove_client_removes_client_from_channels() {
-        let (sender, _) = mpsc::channel(1);
+    fn disconnect_client_collects_other_channel_members() {
+        let (sender1, _) = mpsc::channel(1);
+        let (sender2, mut receiver2) = mpsc::channel(1);
+        let (sender3, mut receiver3) = mpsc::channel(1);
 
         let mut server = Server::default();
 
-        server.clients.insert(1, Client::new(sender));
+        let mut client1 = Client::new(sender1);
+        client1.nickname = Some("alice".to_string());
+
+        let mut client2 = Client::new(sender2);
+        client2.nickname = Some("bob".to_string());
+
+        let mut client3 = Client::new(sender3);
+        client3.nickname = Some("charlie".to_string());
+
+        server.clients.insert(1, client1);
+        server.clients.insert(2, client2);
+        server.clients.insert(3, client3);
 
         let mut rust = Channel::new("#rust".to_string());
-        rust.members.insert(1);
-        rust.members.insert(2);
-
-        let mut general = Channel::new("#general".to_string());
-        general.members.insert(1);
-        general.members.insert(3);
+        rust.members.extend([1, 2, 3]);
 
         server.channels.insert("#rust".to_string(), rust);
-        server.channels.insert("#general".to_string(), general);
 
-        server.remove_client(1);
+        let result = server.disconnect_client(1);
+
+        assert_eq!(result.nickname, Some("alice".to_string()));
+        assert_eq!(result.senders.len(), 2);
 
         assert!(!server.clients.contains_key(&1));
-
         assert!(!server.channels["#rust"].members.contains(&1));
         assert!(server.channels["#rust"].members.contains(&2));
+        assert!(server.channels["#rust"].members.contains(&3));
 
-        assert!(!server.channels["#general"].members.contains(&1));
-        assert!(server.channels["#general"].members.contains(&3));
+        result.senders[0]
+            .try_send(":alice QUIT :Client Quit".to_string())
+            .unwrap();
+
+        result.senders[1]
+            .try_send(":alice QUIT :Client Quit".to_string())
+            .unwrap();
+
+        let messages = [receiver2.try_recv().unwrap(), receiver3.try_recv().unwrap()];
+
+        assert!(
+            messages
+                .iter()
+                .all(|message| message == ":alice QUIT :Client Quit")
+        );
     }
 
     #[test]
-    fn remove_client_removes_empty_channels() {
+    fn disconnect_client_removes_empty_channels() {
         let (sender, _) = mpsc::channel(1);
 
         let mut server = Server::default();
@@ -751,14 +820,14 @@ mod tests {
 
         server.channels.insert("#rust".to_string(), channel);
 
-        server.remove_client(1);
+        server.disconnect_client(1);
 
         assert!(!server.clients.contains_key(&1));
         assert!(!server.channels.contains_key("#rust"));
     }
 
     #[test]
-    fn remove_client_keeps_non_empty_channels() {
+    fn disconnect_client_keeps_non_empty_channels() {
         let (sender, _) = mpsc::channel(1);
 
         let mut server = Server::default();
@@ -771,9 +840,153 @@ mod tests {
 
         server.channels.insert("#rust".to_string(), channel);
 
-        server.remove_client(1);
+        server.disconnect_client(1);
 
         assert!(server.channels.contains_key("#rust"));
         assert_eq!(server.channels["#rust"].members, HashSet::from([2]));
+    }
+
+    #[tokio::test]
+    async fn part_removes_client_from_channel() {
+        let (sender1, mut receiver1) = mpsc::channel(1);
+        let (sender2, mut receiver2) = mpsc::channel(1);
+
+        let mut server = Server::default();
+
+        let mut alice = Client::new(sender1.clone());
+        alice.nickname = Some("alice".to_string());
+        alice.username = Some("alice".to_string());
+
+        let mut bob = Client::new(sender2.clone());
+        bob.nickname = Some("bob".to_string());
+        bob.username = Some("bob".to_string());
+
+        server.clients.insert(1, alice);
+        server.clients.insert(2, bob);
+
+        let mut channel = Channel::new("#rust".to_string());
+        channel.members.extend([1, 2]);
+
+        server.channels.insert("#rust".to_string(), channel);
+
+        let server = Arc::new(RwLock::new(server));
+
+        handle_part(1, "#rust", Arc::clone(&server), &sender1)
+            .await
+            .unwrap();
+
+        {
+            let server = server.read().await;
+
+            assert!(!server.channels["#rust"].members.contains(&1));
+            assert!(server.channels["#rust"].members.contains(&2));
+        }
+
+        assert_eq!(receiver1.recv().await.unwrap(), ":alice PART #rust");
+        assert_eq!(receiver2.recv().await.unwrap(), ":alice PART #rust");
+    }
+
+    #[tokio::test]
+    async fn part_removes_empty_channel() {
+        let (sender, mut receiver) = mpsc::channel(1);
+
+        let mut server = Server::default();
+
+        let mut alice = Client::new(sender.clone());
+        alice.nickname = Some("alice".to_string());
+        alice.username = Some("alice".to_string());
+
+        server.clients.insert(1, alice);
+
+        let mut channel = Channel::new("#rust".to_string());
+        channel.members.insert(1);
+
+        server.channels.insert("#rust".to_string(), channel);
+
+        let server = Arc::new(RwLock::new(server));
+
+        handle_part(1, "#rust", Arc::clone(&server), &sender)
+            .await
+            .unwrap();
+
+        {
+            let server = server.read().await;
+
+            assert!(!server.channels.contains_key("#rust"));
+        }
+
+        assert_eq!(receiver.recv().await.unwrap(), ":alice PART #rust");
+    }
+
+    #[tokio::test]
+    async fn part_returns_error_when_client_is_not_on_channel() {
+        let (sender1, mut receiver1) = mpsc::channel(1);
+        let (sender2, _) = mpsc::channel(1);
+
+        let mut server = Server::default();
+
+        let mut alice = Client::new(sender1.clone());
+        alice.nickname = Some("alice".to_string());
+        alice.username = Some("alice".to_string());
+
+        let mut bob = Client::new(sender2.clone());
+        bob.nickname = Some("bob".to_string());
+        bob.username = Some("bob".to_string());
+
+        server.clients.insert(1, alice);
+        server.clients.insert(2, bob);
+
+        let mut channel = Channel::new("#rust".to_string());
+        channel.members.insert(2);
+
+        server.channels.insert("#rust".to_string(), channel);
+
+        let server = Arc::new(RwLock::new(server));
+
+        handle_part(1, "#rust", Arc::clone(&server), &sender1)
+            .await
+            .unwrap();
+
+        let message = receiver1.recv().await.unwrap();
+
+        assert_eq!(
+            message,
+            ":server 442 alice #rust :You're not on that channel"
+        );
+
+        {
+            let server = server.read().await;
+
+            assert_eq!(server.channels["#rust"].members, HashSet::from([2]));
+        }
+    }
+
+    #[tokio::test]
+    async fn part_returns_error_when_channel_does_not_exist() {
+        let (sender, mut receiver) = mpsc::channel(1);
+
+        let mut server = Server::default();
+
+        let mut alice = Client::new(sender.clone());
+        alice.nickname = Some("alice".to_string());
+        alice.username = Some("alice".to_string());
+
+        server.clients.insert(1, alice);
+
+        let server = Arc::new(RwLock::new(server));
+
+        handle_part(1, "#rust", Arc::clone(&server), &sender)
+            .await
+            .unwrap();
+
+        let message = receiver.recv().await.unwrap();
+
+        assert_eq!(message, ":server 403 alice #rust :No such channel");
+
+        {
+            let server = server.read().await;
+
+            assert!(server.channels.is_empty());
+        }
     }
 }
