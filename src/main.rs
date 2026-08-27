@@ -126,6 +126,7 @@ enum Command {
     User { username: String, realname: String },
     Join(String),
     Part(String),
+    Privmsg { target: String, message: String },
     Ping(String),
     Pong(String),
     Quit,
@@ -187,6 +188,19 @@ fn parse_command(line: &str) -> Command {
         }
         "JOIN" => Command::Join(rest.to_string()),
         "PART" => Command::Part(rest.to_string()),
+        "PRIVMSG" => {
+            let mut parts = rest.splitn(2, ' ');
+
+            let target = parts.next().unwrap_or("").to_string();
+
+            let message = parts
+                .next()
+                .unwrap_or("")
+                .trim_start_matches(':')
+                .to_string();
+
+            Command::Privmsg { target, message }
+        }
         "PING" => Command::Ping(rest.trim_start_matches(':').to_string()),
         "PONG" => Command::Pong(rest.trim_start_matches(':').to_string()),
         "QUIT" => Command::Quit,
@@ -310,6 +324,9 @@ async fn handle_command(
         }
         Command::Join(channel) => handle_join(client_id, &channel, server, sender).await?,
         Command::Part(channel) => handle_part(client_id, &channel, server, sender).await?,
+        Command::Privmsg { target, message } => {
+            handle_privmsg(client_id, &target, &message, server).await?
+        }
         Command::Ping(token) => sender.send(format!("PONG :{token}")).await?,
         Command::Pong(token) => println!("[{client_id}] PONG {token}"),
         Command::Quit => return Ok(false),
@@ -568,6 +585,68 @@ async fn handle_part(
     Ok(())
 }
 
+async fn handle_privmsg(
+    client_id: ClientId,
+    target: &str,
+    message: &str,
+    server: Arc<RwLock<Server>>,
+) -> Result<()> {
+    let nickname = {
+        let server = server.read().await;
+
+        server
+            .clients
+            .get(&client_id)
+            .filter(|client| client.is_registered())
+            .and_then(|client| client.nickname.clone())
+            .ok_or("Client is not registered")?
+    };
+
+    let message = format!(":{nickname} PRIVMSG {target} :{message}");
+
+    if target.starts_with('#') {
+        let senders: Vec<mpsc::Sender<String>> = {
+            let server = server.read().await;
+
+            let channel = server.channels.get(target).ok_or("No such channel")?;
+
+            if !channel.members.contains(&client_id) {
+                return Err("Client is not on channel".into());
+            }
+
+            channel
+                .members
+                .iter()
+                .filter_map(|member_id| {
+                    server
+                        .clients
+                        .get(member_id)
+                        .map(|client| client.sender.clone())
+                })
+                .collect()
+        };
+
+        for sender in senders {
+            sender.send(message.clone()).await?;
+        }
+    } else {
+        let target_sender = {
+            let server = server.read().await;
+
+            server
+                .clients
+                .values()
+                .find(|client| client.nickname.as_deref() == Some(target))
+                .map(|client| client.sender.clone())
+                .ok_or("No such nickname")?
+        };
+
+        target_sender.send(message).await?;
+    }
+
+    Ok(())
+}
+
 /// 첫글자: A-Za-z, IRC special character
 /// 나머지: A-Za-z0-9, IRC special character
 fn is_valid_nickname(nickname: &str) -> bool {
@@ -635,6 +714,27 @@ mod tests {
         let command = parse_command("JOIN #rust");
 
         assert_matches!(command, Command::Join(channel) if channel == "#rust");
+    }
+
+    #[test]
+    fn parse_privmsg() {
+        let command = parse_command("PRIVMSG #rust :hello");
+
+        assert_matches!(command, Command::Privmsg { target, message } if target == "#rust" && message == "hello");
+    }
+
+    #[test]
+    fn parse_privmsg_preserves_message_spaces() {
+        let command = parse_command("PRIVMSG #rust :hello rust server");
+
+        assert_matches!(command, Command::Privmsg { target, message } if target == "#rust" && message == "hello rust server");
+    }
+
+    #[test]
+    fn parse_privmsg_is_case_insensitive() {
+        let command = parse_command("privmsg #rust :hello");
+
+        assert_matches!(command, Command::Privmsg { target, message } if target == "#rust" && message == "hello");
     }
 
     #[test]
@@ -988,5 +1088,124 @@ mod tests {
 
             assert!(server.channels.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn privmsg_is_sent_to_channel_members() {
+        let (sender1, mut receiver1) = mpsc::channel(1);
+        let (sender2, mut receiver2) = mpsc::channel(1);
+
+        let mut server = Server::default();
+
+        let mut alice = Client::new(sender1);
+        alice.nickname = Some("alice".to_string());
+        alice.username = Some("alice".to_string());
+
+        let mut bob = Client::new(sender2);
+        bob.nickname = Some("bob".to_string());
+        bob.username = Some("bob".to_string());
+
+        server.clients.insert(1, alice);
+        server.clients.insert(2, bob);
+
+        let mut channel = Channel::new("#rust".to_string());
+        channel.members.extend([1, 2]);
+
+        server.channels.insert("#rust".to_string(), channel);
+
+        let server = Arc::new(RwLock::new(server));
+
+        handle_privmsg(1, "#rust", "hello rust", Arc::clone(&server))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            receiver1.recv().await.unwrap(),
+            ":alice PRIVMSG #rust :hello rust"
+        );
+        assert_eq!(
+            receiver2.recv().await.unwrap(),
+            ":alice PRIVMSG #rust :hello rust"
+        );
+    }
+
+    #[tokio::test]
+    async fn privmsg_fails_when_client_is_not_channel_member() {
+        let (sender1, _) = mpsc::channel(1);
+        let (sender2, _) = mpsc::channel(1);
+
+        let mut server = Server::default();
+
+        let mut alice = Client::new(sender1);
+        alice.nickname = Some("alice".to_string());
+        alice.username = Some("alice".to_string());
+
+        let mut bob = Client::new(sender2);
+        bob.nickname = Some("bob".to_string());
+        bob.username = Some("bob".to_string());
+
+        server.clients.insert(1, alice);
+        server.clients.insert(2, bob);
+
+        let mut channel = Channel::new("#rust".to_string());
+        channel.members.insert(2);
+
+        server.channels.insert("#rust".to_string(), channel);
+
+        let server = Arc::new(RwLock::new(server));
+
+        let result = handle_privmsg(1, "#rust", "hello rust", Arc::clone(&server)).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn privmsg_is_sent_to_target_user() {
+        let (sender1, mut receiver1) = mpsc::channel(1);
+        let (sender2, mut receiver2) = mpsc::channel(1);
+
+        let mut server = Server::default();
+
+        let mut alice = Client::new(sender1);
+        alice.nickname = Some("alice".to_string());
+        alice.username = Some("alice".to_string());
+
+        let mut bob = Client::new(sender2);
+        bob.nickname = Some("bob".to_string());
+        bob.username = Some("bob".to_string());
+
+        server.clients.insert(1, alice);
+        server.clients.insert(2, bob);
+
+        let server = Arc::new(RwLock::new(server));
+
+        handle_privmsg(1, "bob", "hello bob", Arc::clone(&server))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            receiver2.recv().await.unwrap(),
+            ":alice PRIVMSG bob :hello bob"
+        );
+        assert!(receiver1.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn privmsg_fails_when_target_nickname_does_not_exist() {
+        let (sender, _) = mpsc::channel(1);
+
+        let mut server = Server::default();
+
+        let mut alice = Client::new(sender);
+        alice.nickname = Some("alcie".to_string());
+        alice.username = Some("alcie".to_string());
+
+        server.clients.insert(1, alice);
+
+        let server = Arc::new(RwLock::new(server));
+
+        let result = handle_privmsg(1, "bob", "hello bob", Arc::clone(&server)).await;
+
+        assert!(result.is_err());
     }
 }
