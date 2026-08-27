@@ -123,6 +123,7 @@ impl Channel {
 #[derive(Debug)]
 enum Command {
     Nick(String),
+    Notice { target: String, message: String },
     User { username: String, realname: String },
     Join(String),
     Part(String),
@@ -167,6 +168,19 @@ fn parse_command(line: &str) -> Command {
 
     match command.as_str() {
         "NICK" => Command::Nick(rest.to_string()),
+        "NOTICE" => {
+            let mut parts = rest.splitn(2, ' ');
+
+            let target = parts.next().unwrap_or("").to_string();
+
+            let message = parts
+                .next()
+                .unwrap_or("")
+                .trim_start_matches(':')
+                .to_string();
+
+            Command::Notice { target, message }
+        }
         "USER" => {
             let mut parts = rest.splitn(4, ' ');
 
@@ -319,6 +333,9 @@ async fn handle_command(
 ) -> Result<bool> {
     match command {
         Command::Nick(nickname) => handle_nick(client_id, &nickname, server, sender).await?,
+        Command::Notice { target, message } => {
+            handle_notice(client_id, &target, &message, server).await?
+        }
         Command::User { username, realname } => {
             handle_user(client_id, &username, &realname, server, sender).await?
         }
@@ -408,6 +425,68 @@ async fn handle_nick(
                 ))
                 .await?
         }
+    }
+
+    Ok(())
+}
+
+async fn handle_notice(
+    client_id: ClientId,
+    target: &str,
+    message: &str,
+    server: Arc<RwLock<Server>>,
+) -> Result<()> {
+    let nickname = {
+        let server = server.read().await;
+
+        server
+            .clients
+            .get(&client_id)
+            .filter(|client| client.is_registered())
+            .and_then(|client| client.nickname.clone())
+            .ok_or("Client is not registered")?
+    };
+
+    let message = format!(":{nickname} NOTICE {target} :{message}");
+
+    if target.starts_with('#') {
+        let senders: Vec<mpsc::Sender<String>> = {
+            let server = server.read().await;
+
+            let channel = server.channels.get(target).ok_or("No such channel")?;
+
+            if !channel.members.contains(&client_id) {
+                return Err("Client is not on channel".into());
+            }
+
+            channel
+                .members
+                .iter()
+                .filter_map(|member_id| {
+                    server
+                        .clients
+                        .get(member_id)
+                        .map(|client| client.sender.clone())
+                })
+                .collect()
+        };
+
+        for sender in senders {
+            sender.send(message.clone()).await?;
+        }
+    } else {
+        let target_sender = {
+            let server = server.read().await;
+
+            server
+                .clients
+                .values()
+                .find(|client| client.nickname.as_deref() == Some(target))
+                .map(|client| client.sender.clone())
+                .ok_or("No such nickname")?
+        };
+
+        target_sender.send(message).await?;
     }
 
     Ok(())
@@ -703,6 +782,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_notice() {
+        let command = parse_command("NOTICE bob :hello");
+
+        assert_matches!(command, Command::Notice { target, message } if target == "bob" && message == "hello");
+    }
+
+    #[test]
     fn parse_user() {
         let command = parse_command("USER alice 0 * :Alice Smith");
 
@@ -944,6 +1030,76 @@ mod tests {
 
         assert!(server.channels.contains_key("#rust"));
         assert_eq!(server.channels["#rust"].members, HashSet::from([2]));
+    }
+
+    #[tokio::test]
+    async fn notice_is_sent_to_target_user() {
+        let (sender1, mut receiver1) = mpsc::channel(1);
+        let (sender2, mut receiver2) = mpsc::channel(1);
+
+        let mut server = Server::default();
+
+        let mut alice = Client::new(sender1);
+        alice.nickname = Some("alice".to_string());
+        alice.username = Some("alice".to_string());
+
+        let mut bob = Client::new(sender2);
+        bob.nickname = Some("bob".to_string());
+        bob.username = Some("bob".to_string());
+
+        server.clients.insert(1, alice);
+        server.clients.insert(2, bob);
+
+        let server = Arc::new(RwLock::new(server));
+
+        handle_notice(1, "bob", "hello bob", Arc::clone(&server))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            receiver2.recv().await.unwrap(),
+            ":alice NOTICE bob :hello bob"
+        );
+        assert!(receiver1.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn notice_is_broadcast_to_channel_members() {
+        let (sender1, mut receiver1) = mpsc::channel(1);
+        let (sender2, mut receiver2) = mpsc::channel(1);
+
+        let mut server = Server::default();
+
+        let mut alice = Client::new(sender1);
+        alice.nickname = Some("alice".to_string());
+        alice.username = Some("alice".to_string());
+
+        let mut bob = Client::new(sender2);
+        bob.nickname = Some("bob".to_string());
+        bob.username = Some("bob".to_string());
+
+        server.clients.insert(1, alice);
+        server.clients.insert(2, bob);
+
+        let mut channel = Channel::new("#rust".to_string());
+        channel.members.extend([1, 2]);
+
+        server.channels.insert("#rust".to_string(), channel);
+
+        let server = Arc::new(RwLock::new(server));
+
+        handle_notice(1, "#rust", "hello rust", Arc::clone(&server))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            receiver1.recv().await.unwrap(),
+            ":alice NOTICE #rust :hello rust"
+        );
+        assert_eq!(
+            receiver2.recv().await.unwrap(),
+            ":alice NOTICE #rust :hello rust"
+        );
     }
 
     #[tokio::test]
