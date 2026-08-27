@@ -14,7 +14,7 @@ type ClientId = u64;
 
 const RPL_WELCOME: &str = "001";
 
-// const RPL_TOPIC: &str = "332";
+const RPL_TOPIC: &str = "332";
 // const RPL_TOPICTIME: &str = "333";
 // const RPL_NAMREPLY: &str = "353";
 
@@ -108,6 +108,7 @@ impl Client {
 #[derive(Debug)]
 struct Channel {
     name: String,
+    topic: Option<String>,
     members: HashSet<ClientId>,
 }
 
@@ -115,6 +116,7 @@ impl Channel {
     fn new(name: String) -> Self {
         Self {
             name,
+            topic: None,
             members: HashSet::new(),
         }
     }
@@ -122,15 +124,28 @@ impl Channel {
 
 #[derive(Debug)]
 enum Command {
-    Nick(String),
-    Notice { target: String, message: String },
-    User { username: String, realname: String },
     Join(String),
+    Nick(String),
+    Notice {
+        target: String,
+        message: String,
+    },
+    User {
+        username: String,
+        realname: String,
+    },
     Part(String),
-    Privmsg { target: String, message: String },
+    Privmsg {
+        target: String,
+        message: String,
+    },
     Ping(String),
     Pong(String),
     Quit,
+    Topic {
+        channel: String,
+        topic: Option<String>,
+    },
     Unknown(String),
 }
 
@@ -151,6 +166,19 @@ enum PartResult {
     },
     NoSuchChannel {
         nickname: String,
+    },
+}
+
+#[derive(Debug)]
+enum TopicResult {
+    Changed {
+        nickname: String,
+        topic: String,
+        senders: Vec<mpsc::Sender<String>>,
+    },
+    Queried {
+        nickname: String,
+        topic: Option<String>,
     },
 }
 
@@ -218,8 +246,28 @@ fn parse_command(line: &str) -> Command {
         "PING" => Command::Ping(rest.trim_start_matches(':').to_string()),
         "PONG" => Command::Pong(rest.trim_start_matches(':').to_string()),
         "QUIT" => Command::Quit,
+        "TOPIC" => match parse_topic(rest) {
+            Some((channel, topic)) => Command::Topic { channel, topic },
+            None => Command::Unknown(line.to_string()),
+        },
         _ => Command::Unknown(line.to_string()),
     }
+}
+
+fn parse_topic(rest: &str) -> Option<(String, Option<String>)> {
+    // TODO: topic이 비어있을때 :가 있으면 Unset, :가 없으면 query
+    // 고도화 할때 명세에 따라 변경해야
+    let mut parts = rest.splitn(2, ':');
+
+    let channel = parts.next()?.trim();
+
+    if channel.is_empty() {
+        return None;
+    }
+
+    let topic = parts.next().map(str::to_string);
+
+    Some((channel.to_string(), topic))
 }
 
 #[tokio::main]
@@ -347,6 +395,9 @@ async fn handle_command(
         Command::Ping(token) => sender.send(format!("PONG :{token}")).await?,
         Command::Pong(token) => println!("[{client_id}] PONG {token}"),
         Command::Quit => return Ok(false),
+        Command::Topic { channel, topic } => {
+            handle_topic(client_id, &channel, topic.as_deref(), server, sender).await?
+        }
         Command::Unknown(command) => println!("[{client_id}] Unknown command: {command}"),
     }
 
@@ -726,6 +777,108 @@ async fn handle_privmsg(
     Ok(())
 }
 
+async fn handle_topic(
+    client_id: ClientId,
+    channel_name: &str,
+    topic: Option<&str>,
+    server: Arc<RwLock<Server>>,
+    sender: &mpsc::Sender<String>,
+) -> Result<()> {
+    if !is_valid_channel_name(channel_name) {
+        sender
+            .send(format!(
+                ":{SERVER_NAME} {ERR_NOSUCHCHANNEL} * {channel_name} :No such channel"
+            ))
+            .await?;
+
+        return Ok(());
+    }
+
+    let result = {
+        let mut server = server.write().await;
+
+        let nickname = server
+            .clients
+            .get(&client_id)
+            .filter(|client| client.is_registered())
+            .and_then(|client| client.nickname.clone())
+            .ok_or("Client is not registered")?;
+
+        let member_ids: Vec<ClientId> = server
+            .channels
+            .get(channel_name)
+            .ok_or("No such channel")?
+            .members
+            .iter()
+            .copied()
+            .collect();
+
+        if !member_ids.contains(&client_id) {
+            return Err("Client is not on channel".into());
+        }
+
+        match topic {
+            Some(topic) => {
+                if let Some(channel) = server.channels.get_mut(channel_name) {
+                    channel.topic = Some(topic.to_string());
+                }
+
+                let senders: Vec<mpsc::Sender<String>> = member_ids
+                    .iter()
+                    .filter_map(|member_id| {
+                        server
+                            .clients
+                            .get(member_id)
+                            .map(|client| client.sender.clone())
+                    })
+                    .collect();
+
+                TopicResult::Changed {
+                    nickname,
+                    topic: topic.to_string(),
+                    senders,
+                }
+            }
+            None => {
+                let current_topic = server
+                    .channels
+                    .get(channel_name)
+                    .and_then(|channel| channel.topic.clone());
+
+                TopicResult::Queried {
+                    nickname,
+                    topic: current_topic,
+                }
+            }
+        }
+    };
+
+    match result {
+        TopicResult::Changed {
+            nickname,
+            topic,
+            senders,
+        } => {
+            let message = format!(":{nickname} TOPIC {channel_name} :{topic}");
+
+            for sender in senders {
+                sender.send(message.clone()).await?;
+            }
+        }
+        TopicResult::Queried { nickname, topic } => {
+            if let Some(topic) = topic {
+                sender
+                    .send(format!(
+                        ":{SERVER_NAME} {RPL_TOPIC} {nickname} {channel_name} :{topic}"
+                    ))
+                    .await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// 첫글자: A-Za-z, IRC special character
 /// 나머지: A-Za-z0-9, IRC special character
 fn is_valid_nickname(nickname: &str) -> bool {
@@ -835,6 +988,20 @@ mod tests {
         let command = parse_command("PING :12345");
 
         assert_matches!(command, Command::Ping(token) if token == "12345")
+    }
+
+    #[test]
+    fn parse_topic_set() {
+        let command = parse_command("TOPIC #rust :Rust programming");
+
+        assert_matches!(command, Command::Topic { channel, topic } if channel == "#rust" && topic == Some("Rust programming".to_string()));
+    }
+
+    #[test]
+    fn parse_topic_query() {
+        let command = parse_command("TOPIC #rust");
+
+        assert_matches!(command, Command::Topic { channel, topic } if channel == "#rust" && topic.is_none());
     }
 
     #[test]
@@ -1030,6 +1197,13 @@ mod tests {
 
         assert!(server.channels.contains_key("#rust"));
         assert_eq!(server.channels["#rust"].members, HashSet::from([2]));
+    }
+
+    #[test]
+    fn new_channel_has_no_topic() {
+        let channel = Channel::new("#rust".to_string());
+
+        assert_eq!(channel.topic, None);
     }
 
     #[tokio::test]
@@ -1363,5 +1537,81 @@ mod tests {
         let result = handle_privmsg(1, "bob", "hello bob", Arc::clone(&server)).await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn topic_is_changed() {
+        let (sender, mut receiver) = mpsc::channel(1);
+
+        let mut server = Server::default();
+
+        let mut alice = Client::new(sender.clone());
+        alice.nickname = Some("alice".to_string());
+        alice.username = Some("alice".to_string());
+
+        server.clients.insert(1, alice);
+
+        let mut channel = Channel::new("#rust".to_string());
+        channel.members.insert(1);
+
+        server.channels.insert("#rust".to_string(), channel);
+
+        let server = Arc::new(RwLock::new(server));
+
+        handle_topic(
+            1,
+            "#rust",
+            Some("Rust programming"),
+            Arc::clone(&server),
+            &sender,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            ":alice TOPIC #rust :Rust programming"
+        );
+        assert_eq!(
+            server
+                .read()
+                .await
+                .channels
+                .get("#rust")
+                .unwrap()
+                .topic
+                .as_deref(),
+            Some("Rust programming")
+        );
+    }
+
+    #[tokio::test]
+    async fn topic_can_be_queried() {
+        let (sender, mut receiver) = mpsc::channel(1);
+
+        let mut server = Server::default();
+
+        let mut alice = Client::new(sender.clone());
+        alice.nickname = Some("alice".to_string());
+        alice.username = Some("alice".to_string());
+
+        server.clients.insert(1, alice);
+
+        let mut channel = Channel::new("#rust".to_string());
+        channel.members.insert(1);
+        channel.topic = Some("Rust programming".to_string());
+
+        server.channels.insert("#rust".to_string(), channel);
+
+        let server = Arc::new(RwLock::new(server));
+
+        handle_topic(1, "#rust", None, Arc::clone(&server), &sender)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            ":server 332 alice #rust :Rust programming"
+        );
     }
 }
