@@ -14,11 +14,15 @@ type ClientId = u64;
 
 const RPL_WELCOME: &str = "001";
 
+// const RPL_LISTSTART: &str = "321";
+const RPL_LIST: &str = "322";
+const RPL_LISTEND: &str = "323";
 const RPL_TOPIC: &str = "332";
 // const RPL_TOPICTIME: &str = "333";
 const RPL_NAMREPLY: &str = "353";
 const RPL_ENDOFNAMES: &str = "366";
 
+// const ERR_NOSUCHSERVER: &str = "402";
 const ERR_NOSUCHCHANNEL: &str = "403";
 // const ERR_TOOMANYCHANNELS: &str = "405";
 const ERR_NOTONCHANNEL: &str = "442";
@@ -126,6 +130,7 @@ impl Channel {
 #[derive(Debug)]
 enum Command {
     Join(String),
+    List(Option<String>),
     Names(String),
     Nick(String),
     Notice {
@@ -190,6 +195,13 @@ struct DisconnectResult {
     senders: Vec<mpsc::Sender<String>>,
 }
 
+#[derive(Debug)]
+struct ListEntry {
+    name: String,
+    member_count: usize,
+    topic: Option<String>,
+}
+
 fn parse_command(line: &str) -> Command {
     let mut parts = line.splitn(2, ' ');
 
@@ -197,6 +209,13 @@ fn parse_command(line: &str) -> Command {
     let rest = parts.next().unwrap_or("").trim();
 
     match command.as_str() {
+        "LIST" => {
+            if rest.is_empty() {
+                Command::List(None)
+            } else {
+                Command::List(Some(rest.to_string()))
+            }
+        }
         "NAMES" => Command::Names(rest.to_string()),
         "NICK" => Command::Nick(rest.to_string()),
         "NOTICE" => {
@@ -383,6 +402,9 @@ async fn handle_command(
     sender: &mpsc::Sender<String>,
 ) -> Result<bool> {
     match command {
+        Command::List(channel) => {
+            handle_list(client_id, channel.as_deref(), server, sender).await?
+        }
         Command::Names(channel) => handle_names(client_id, &channel, server, sender).await?,
         Command::Nick(nickname) => handle_nick(client_id, &nickname, server, sender).await?,
         Command::Notice { target, message } => {
@@ -406,6 +428,70 @@ async fn handle_command(
     }
 
     Ok(true)
+}
+
+async fn handle_list(
+    client_id: ClientId,
+    channel_name: Option<&str>,
+    server: Arc<RwLock<Server>>,
+    sender: &mpsc::Sender<String>,
+) -> Result<()> {
+    let (nickname, mut entries) = {
+        let server = server.read().await;
+
+        let nickname = server
+            .clients
+            .get(&client_id)
+            .filter(|client| client.is_registered())
+            .and_then(|client| client.nickname.clone())
+            .ok_or("Client is not registered")?;
+
+        let entries: Vec<ListEntry> = match channel_name {
+            Some(channel_name) => server
+                .channels
+                .get(channel_name)
+                .map(|channel| {
+                    vec![ListEntry {
+                        name: channel.name.clone(),
+                        member_count: channel.members.len(),
+                        topic: channel.topic.clone(),
+                    }]
+                })
+                .unwrap_or_default(),
+            None => server
+                .channels
+                .values()
+                .map(|channel| ListEntry {
+                    name: channel.name.clone(),
+                    member_count: channel.members.len(),
+                    topic: channel.topic.clone(),
+                })
+                .collect(),
+        };
+
+        (nickname, entries)
+    };
+
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+    for entry in entries {
+        let topic = entry.topic.unwrap_or_default();
+
+        sender
+            .send(format!(
+                ":{SERVER_NAME} {RPL_LIST} {nickname} {} {} :{topic}",
+                entry.name, entry.member_count
+            ))
+            .await?;
+    }
+
+    sender
+        .send(format!(
+            ":{SERVER_NAME} {RPL_LISTEND} {nickname} :End of /LIST"
+        ))
+        .await?;
+
+    Ok(())
 }
 
 async fn handle_names(
@@ -983,6 +1069,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_list() {
+        let command = parse_command("LIST");
+
+        assert_matches!(command, Command::List(None));
+    }
+
+    #[test]
+    fn parse_list_with_channel() {
+        let command = parse_command("LIST #rust");
+
+        assert_matches!(command, Command::List(Some(channel)) if channel == "#rust");
+    }
+
+    #[test]
     fn parse_nick() {
         let command = parse_command("NICK alice");
 
@@ -1259,6 +1359,109 @@ mod tests {
         let channel = Channel::new("#rust".to_string());
 
         assert_eq!(channel.topic, None);
+    }
+
+    #[tokio::test]
+    async fn list_returns_all_channels() {
+        let (sender, mut receiver) = mpsc::channel(3);
+
+        let mut server = Server::default();
+
+        let mut alice = Client::new(sender.clone());
+        alice.nickname = Some("alice".to_string());
+        alice.username = Some("alice".to_string());
+
+        server.clients.insert(1, alice);
+
+        let mut rust = Channel::new("#rust".to_string());
+        rust.topic = Some("Rust programming".to_string());
+        rust.members.extend([1, 2]);
+
+        let mut general = Channel::new("#general".to_string());
+        general.members.insert(1);
+
+        server.channels.insert("#rust".to_string(), rust);
+        server.channels.insert("#general".to_string(), general);
+
+        let server = Arc::new(RwLock::new(server));
+
+        handle_list(1, None, Arc::clone(&server), &sender)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            ":server 322 alice #general 1 :"
+        );
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            ":server 322 alice #rust 2 :Rust programming"
+        );
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            ":server 323 alice :End of /LIST"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_returns_requested_channel_only() {
+        let (sender, mut receiver) = mpsc::channel(2);
+
+        let mut server = Server::default();
+
+        let mut alice = Client::new(sender.clone());
+        alice.nickname = Some("alice".to_string());
+        alice.username = Some("alice".to_string());
+
+        server.clients.insert(1, alice);
+
+        let mut rust = Channel::new("#rust".to_string());
+        rust.topic = Some("Rust programming".to_string());
+        rust.members.extend([1, 2]);
+
+        let general = Channel::new("#general".to_string());
+
+        server.channels.insert("#rust".to_string(), rust);
+        server.channels.insert("#general".to_string(), general);
+
+        let server = Arc::new(RwLock::new(server));
+
+        handle_list(1, Some("#rust"), Arc::clone(&server), &sender)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            ":server 322 alice #rust 2 :Rust programming"
+        );
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            ":server 323 alice :End of /LIST"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_unknown_channel_returns_only_end() {
+        let (sender, mut receiver) = mpsc::channel(1);
+
+        let mut server = Server::default();
+
+        let mut alice = Client::new(sender.clone());
+        alice.nickname = Some("alice".to_string());
+        alice.username = Some("alice".to_string());
+
+        server.clients.insert(1, alice);
+
+        let server = Arc::new(RwLock::new(server));
+
+        handle_list(1, Some("#unknown"), Arc::clone(&server), &sender)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            ":server 323 alice :End of /LIST"
+        );
     }
 
     #[tokio::test]
