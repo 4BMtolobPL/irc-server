@@ -22,10 +22,12 @@ const RPL_TOPIC: &str = "332";
 const RPL_NAMREPLY: &str = "353";
 const RPL_ENDOFNAMES: &str = "366";
 
+const ERR_NOSUCHNICK: &str = "401";
 // const ERR_NOSUCHSERVER: &str = "402";
 const ERR_NOSUCHCHANNEL: &str = "403";
 // const ERR_TOOMANYCHANNELS: &str = "405";
 const ERR_NOTONCHANNEL: &str = "442";
+const ERR_NOTREGISTERED: &str = "451";
 // const ERR_NEEDMOREPARAMS: &str = "461";
 // const ERR_CHANNELISFULL: &str = "471";
 // const ERR_INVITEONLYCHAN: &str = "473";
@@ -173,6 +175,31 @@ enum PartResult {
     },
     NoSuchChannel {
         nickname: String,
+    },
+}
+
+#[derive(Debug)]
+enum PrivmsgResult {
+    Channel {
+        message: String,
+        senders: Vec<mpsc::Sender<String>>,
+    },
+    User {
+        message: String,
+        sender: mpsc::Sender<String>,
+    },
+    NotRegistered,
+    NoSuchChannel {
+        nickname: String,
+        channel: String,
+    },
+    NotOnChannel {
+        nickname: String,
+        channel: String,
+    },
+    NoSuchNick {
+        nickname: String,
+        target: String,
     },
 }
 
@@ -416,7 +443,7 @@ async fn handle_command(
         Command::Join(channel) => handle_join(client_id, &channel, server, sender).await?,
         Command::Part(channel) => handle_part(client_id, &channel, server, sender).await?,
         Command::Privmsg { target, message } => {
-            handle_privmsg(client_id, &target, &message, server).await?
+            handle_privmsg(client_id, &target, &message, server, sender).await?
         }
         Command::Ping(token) => sender.send(format!("PONG :{token}")).await?,
         Command::Pong(token) => println!("[{client_id}] PONG {token}"),
@@ -861,58 +888,101 @@ async fn handle_privmsg(
     target: &str,
     message: &str,
     server: Arc<RwLock<Server>>,
+    sender: &mpsc::Sender<String>,
 ) -> Result<()> {
-    let nickname = {
+    let result: PrivmsgResult = {
         let server = server.read().await;
 
-        server
+        if let Some(nickname) = server
             .clients
             .get(&client_id)
             .filter(|client| client.is_registered())
             .and_then(|client| client.nickname.clone())
-            .ok_or("Client is not registered")?
+        {
+            if target.starts_with('#') {
+                match server.channels.get(target) {
+                    None => PrivmsgResult::NoSuchChannel {
+                        nickname: nickname.clone(),
+                        channel: target.to_string(),
+                    },
+                    Some(channel) if !channel.members.contains(&client_id) => {
+                        PrivmsgResult::NotOnChannel {
+                            nickname: nickname.clone(),
+                            channel: target.to_string(),
+                        }
+                    }
+                    Some(channel) => {
+                        let senders = channel
+                            .members
+                            .iter()
+                            .filter_map(|member_id| {
+                                server
+                                    .clients
+                                    .get(member_id)
+                                    .map(|client| client.sender.clone())
+                            })
+                            .collect();
+
+                        PrivmsgResult::Channel {
+                            message: format!(":{nickname} PRIVMSG {target} :{message}"),
+                            senders,
+                        }
+                    }
+                }
+            } else {
+                match server
+                    .clients
+                    .values()
+                    .find(|client| client.nickname.as_deref() == Some(target))
+                {
+                    Some(client) => PrivmsgResult::User {
+                        message: format!(":{nickname} PRIVMSG {target} :{message}"),
+                        sender: client.sender.clone(),
+                    },
+                    None => PrivmsgResult::NoSuchNick {
+                        nickname,
+                        target: target.to_string(),
+                    },
+                }
+            }
+        } else {
+            PrivmsgResult::NotRegistered
+        }
     };
 
-    let message = format!(":{nickname} PRIVMSG {target} :{message}");
-
-    if target.starts_with('#') {
-        let senders: Vec<mpsc::Sender<String>> = {
-            let server = server.read().await;
-
-            let channel = server.channels.get(target).ok_or("No such channel")?;
-
-            if !channel.members.contains(&client_id) {
-                return Err("Client is not on channel".into());
+    match result {
+        PrivmsgResult::Channel { message, senders } => {
+            for sender in senders {
+                sender.send(message.clone()).await?;
             }
-
-            channel
-                .members
-                .iter()
-                .filter_map(|member_id| {
-                    server
-                        .clients
-                        .get(member_id)
-                        .map(|client| client.sender.clone())
-                })
-                .collect()
-        };
-
-        for sender in senders {
-            sender.send(message.clone()).await?;
         }
-    } else {
-        let target_sender = {
-            let server = server.read().await;
-
-            server
-                .clients
-                .values()
-                .find(|client| client.nickname.as_deref() == Some(target))
-                .map(|client| client.sender.clone())
-                .ok_or("No such nickname")?
-        };
-
-        target_sender.send(message).await?;
+        PrivmsgResult::User { message, sender } => sender.send(message).await?,
+        PrivmsgResult::NotRegistered => {
+            sender
+                .send(format!(
+                    ":{SERVER_NAME} {ERR_NOTREGISTERED} * :You have not registered"
+                ))
+                .await?
+        }
+        PrivmsgResult::NoSuchChannel { nickname, channel } => {
+            sender
+                .send(format!(
+                    ":{SERVER_NAME} {ERR_NOSUCHCHANNEL} {nickname} {channel} :No such channel"
+                ))
+                .await?
+        }
+        PrivmsgResult::NotOnChannel { nickname, channel } => sender
+            .send(format!(
+                ":{SERVER_NAME} {ERR_NOTONCHANNEL} {nickname} {channel} :You're not on that channel"
+            ))
+            .await?,
+        PrivmsgResult::NoSuchNick { nickname, target } => {
+            sender
+                .send(format!(
+                    ":{SERVER_NAME} {ERR_NOSUCHNICK} {nickname} {target} :No such nick"
+                ))
+                .await?
+        }
     }
 
     Ok(())
@@ -1756,7 +1826,7 @@ mod tests {
 
         let mut server = Server::default();
 
-        let mut alice = Client::new(sender1);
+        let mut alice = Client::new(sender1.clone());
         alice.nickname = Some("alice".to_string());
         alice.username = Some("alice".to_string());
 
@@ -1774,7 +1844,7 @@ mod tests {
 
         let server = Arc::new(RwLock::new(server));
 
-        handle_privmsg(1, "#rust", "hello rust", Arc::clone(&server))
+        handle_privmsg(1, "#rust", "hello rust", Arc::clone(&server), &sender1)
             .await
             .unwrap();
 
@@ -1789,13 +1859,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn privmsg_fails_when_client_is_not_channel_member() {
-        let (sender1, _) = mpsc::channel(1);
+    async fn privmsg_is_sent_to_target_user() {
+        let (sender1, mut receiver1) = mpsc::channel(1);
+        let (sender2, mut receiver2) = mpsc::channel(1);
+
+        let mut server = Server::default();
+
+        let mut alice = Client::new(sender1.clone());
+        alice.nickname = Some("alice".to_string());
+        alice.username = Some("alice".to_string());
+
+        let mut bob = Client::new(sender2);
+        bob.nickname = Some("bob".to_string());
+        bob.username = Some("bob".to_string());
+
+        server.clients.insert(1, alice);
+        server.clients.insert(2, bob);
+
+        let server = Arc::new(RwLock::new(server));
+
+        handle_privmsg(1, "bob", "hello bob", Arc::clone(&server), &sender1)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            receiver2.recv().await.unwrap(),
+            ":alice PRIVMSG bob :hello bob"
+        );
+        assert!(receiver1.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn privmsg_returns_error_when_client_is_not_on_channel() {
+        let (sender1, mut receiver1) = mpsc::channel(1);
         let (sender2, _) = mpsc::channel(1);
 
         let mut server = Server::default();
 
-        let mut alice = Client::new(sender1);
+        let mut alice = Client::new(sender1.clone());
         alice.nickname = Some("alice".to_string());
         alice.username = Some("alice".to_string());
 
@@ -1813,59 +1914,59 @@ mod tests {
 
         let server = Arc::new(RwLock::new(server));
 
-        let result = handle_privmsg(1, "#rust", "hello rust", Arc::clone(&server)).await;
+        let result = handle_privmsg(1, "#rust", "hello rust", Arc::clone(&server), &sender1).await;
 
-        assert!(result.is_err());
+        assert!(result.is_ok());
+        assert_eq!(
+            receiver1.recv().await.unwrap(),
+            ":server 442 alice #rust :You're not on that channel"
+        );
     }
 
     #[tokio::test]
-    async fn privmsg_is_sent_to_target_user() {
-        let (sender1, mut receiver1) = mpsc::channel(1);
-        let (sender2, mut receiver2) = mpsc::channel(1);
+    async fn privmsg_returns_error_when_target_nickname_does_not_exist() {
+        let (sender, mut receiver) = mpsc::channel(1);
 
         let mut server = Server::default();
 
-        let mut alice = Client::new(sender1);
+        let mut alice = Client::new(sender.clone());
         alice.nickname = Some("alice".to_string());
         alice.username = Some("alice".to_string());
 
-        let mut bob = Client::new(sender2);
-        bob.nickname = Some("bob".to_string());
-        bob.username = Some("bob".to_string());
-
         server.clients.insert(1, alice);
-        server.clients.insert(2, bob);
 
         let server = Arc::new(RwLock::new(server));
 
-        handle_privmsg(1, "bob", "hello bob", Arc::clone(&server))
-            .await
-            .unwrap();
+        let result = handle_privmsg(1, "bob", "hello bob", Arc::clone(&server), &sender).await;
 
+        assert!(result.is_ok());
         assert_eq!(
-            receiver2.recv().await.unwrap(),
-            ":alice PRIVMSG bob :hello bob"
+            receiver.recv().await.unwrap(),
+            ":server 401 alice bob :No such nick"
         );
-        assert!(receiver1.try_recv().is_err());
     }
 
     #[tokio::test]
-    async fn privmsg_fails_when_target_nickname_does_not_exist() {
-        let (sender, _) = mpsc::channel(1);
+    async fn privmsg_returns_error_when_channel_does_not_exist() {
+        let (sender, mut receiver) = mpsc::channel(1);
 
         let mut server = Server::default();
 
-        let mut alice = Client::new(sender);
-        alice.nickname = Some("alcie".to_string());
-        alice.username = Some("alcie".to_string());
+        let mut alice = Client::new(sender.clone());
+        alice.nickname = Some("alice".to_string());
+        alice.username = Some("alice".to_string());
 
         server.clients.insert(1, alice);
 
         let server = Arc::new(RwLock::new(server));
 
-        let result = handle_privmsg(1, "bob", "hello bob", Arc::clone(&server)).await;
+        let result = handle_privmsg(1, "#unknown", "hello", Arc::clone(&server), &sender).await;
 
-        assert!(result.is_err());
+        assert!(result.is_ok());
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            ":server 403 alice #unknown :No such channel"
+        );
     }
 
     #[tokio::test]
