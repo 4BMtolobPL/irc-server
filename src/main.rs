@@ -120,9 +120,9 @@ struct Channel {
 }
 
 impl Channel {
-    fn new(name: String) -> Self {
+    fn new(name: &str) -> Self {
         Self {
-            name,
+            name: name.to_string(),
             topic: None,
             members: HashSet::new(),
         }
@@ -837,7 +837,7 @@ async fn handle_join(
             let channel = server
                 .channels
                 .entry(channel_name.to_string())
-                .or_insert_with(|| Channel::new(channel_name.to_string()));
+                .or_insert_with(|| Channel::new(channel_name));
 
             let inserted = channel.members.insert(client_id);
 
@@ -1439,7 +1439,7 @@ mod tests {
         server.clients.insert(2, client2);
         server.clients.insert(3, client3);
 
-        let mut rust = Channel::new("#rust".to_string());
+        let mut rust = Channel::new("#rust");
         rust.members.extend([1, 2, 3]);
 
         server.channels.insert("#rust".to_string(), rust);
@@ -1479,7 +1479,7 @@ mod tests {
 
         server.clients.insert(1, Client::new(sender));
 
-        let mut channel = Channel::new("#rust".to_string());
+        let mut channel = Channel::new("#rust");
         channel.members.insert(1);
 
         server.channels.insert("#rust".to_string(), channel);
@@ -1498,7 +1498,7 @@ mod tests {
 
         server.clients.insert(1, Client::new(sender));
 
-        let mut channel = Channel::new("#rust".to_string());
+        let mut channel = Channel::new("#rust");
         channel.members.insert(1);
         channel.members.insert(2);
 
@@ -1512,7 +1512,7 @@ mod tests {
 
     #[test]
     fn new_channel_has_no_topic() {
-        let channel = Channel::new("#rust".to_string());
+        let channel = Channel::new("#rust");
 
         assert_eq!(channel.topic, None);
     }
@@ -1529,11 +1529,11 @@ mod tests {
 
         server.clients.insert(1, alice);
 
-        let mut rust = Channel::new("#rust".to_string());
+        let mut rust = Channel::new("#rust");
         rust.topic = Some("Rust programming".to_string());
         rust.members.extend([1, 2]);
 
-        let mut general = Channel::new("#general".to_string());
+        let mut general = Channel::new("#general");
         general.members.insert(1);
 
         server.channels.insert("#rust".to_string(), rust);
@@ -1571,11 +1571,11 @@ mod tests {
 
         server.clients.insert(1, alice);
 
-        let mut rust = Channel::new("#rust".to_string());
+        let mut rust = Channel::new("#rust");
         rust.topic = Some("Rust programming".to_string());
         rust.members.extend([1, 2]);
 
-        let general = Channel::new("#general".to_string());
+        let general = Channel::new("#general");
 
         server.channels.insert("#rust".to_string(), rust);
         server.channels.insert("#general".to_string(), general);
@@ -1657,7 +1657,7 @@ mod tests {
         server.clients.insert(1, alice);
         server.clients.insert(2, bob);
 
-        let mut channel = Channel::new("#rust".to_string());
+        let mut channel = Channel::new("#rust");
         channel.members.extend([1, 2]);
 
         server.channels.insert("#rust".to_string(), channel);
@@ -1692,7 +1692,7 @@ mod tests {
 
         server
             .channels
-            .insert("#rust".to_string(), Channel::new("#rust".to_string()));
+            .insert("#rust".to_string(), Channel::new("#rust"));
 
         let server = Arc::new(RwLock::new(server));
 
@@ -1717,7 +1717,7 @@ mod tests {
         let mut server = Server::default();
         server.clients.insert(1, Client::new(sender.clone()));
 
-        let channel = Channel::new("#rust".to_string());
+        let channel = Channel::new("#rust");
         server.channels.insert("#rust".to_string(), channel);
 
         let server = Arc::new(RwLock::new(server));
@@ -1804,7 +1804,7 @@ mod tests {
         server.clients.insert(1, alice);
         server.clients.insert(2, bob);
 
-        let mut channel = Channel::new("#rust".to_string());
+        let mut channel = Channel::new("#rust");
         channel.members.extend([1, 2]);
 
         server.channels.insert("#rust".to_string(), channel);
@@ -1885,7 +1885,7 @@ mod tests {
         server.clients.insert(1, alice);
         server.clients.insert(2, bob);
 
-        let mut channel = Channel::new("#rust".to_string());
+        let mut channel = Channel::new("#rust");
         channel.members.insert(2);
 
         server.channels.insert("#rust".to_string(), channel);
@@ -1906,7 +1906,7 @@ mod tests {
         let mut server = Server::default();
         server.clients.insert(1, Client::new(sender.clone()));
 
-        let channel = Channel::new("#rust".to_string());
+        let channel = Channel::new("#rust");
         server.channels.insert("#rust".to_string(), channel);
 
         let server = Arc::new(RwLock::new(server));
@@ -1939,7 +1939,7 @@ mod tests {
         server.clients.insert(1, alice);
         server.clients.insert(2, bob);
 
-        let mut channel = Channel::new("#rust".to_string());
+        let mut channel = Channel::new("#rust");
         channel.members.extend([1, 2]);
 
         server.channels.insert("#rust".to_string(), channel);
@@ -1973,7 +1973,7 @@ mod tests {
 
         server.clients.insert(1, alice);
 
-        let mut channel = Channel::new("#rust".to_string());
+        let mut channel = Channel::new("#rust");
         channel.members.insert(1);
 
         server.channels.insert("#rust".to_string(), channel);
@@ -2011,7 +2011,7 @@ mod tests {
         server.clients.insert(1, alice);
         server.clients.insert(2, bob);
 
-        let mut channel = Channel::new("#rust".to_string());
+        let mut channel = Channel::new("#rust");
         channel.members.insert(2);
 
         server.channels.insert("#rust".to_string(), channel);
@@ -2083,7 +2083,7 @@ mod tests {
         server.clients.insert(1, alice);
         server.clients.insert(2, bob);
 
-        let mut channel = Channel::new("#rust".to_string());
+        let mut channel = Channel::new("#rust");
         channel.members.extend([1, 2]);
 
         server.channels.insert("#rust".to_string(), channel);
@@ -2153,7 +2153,7 @@ mod tests {
         server.clients.insert(1, alice);
         server.clients.insert(2, bob);
 
-        let mut channel = Channel::new("#rust".to_string());
+        let mut channel = Channel::new("#rust");
         channel.members.insert(2);
 
         server.channels.insert("#rust".to_string(), channel);
@@ -2227,7 +2227,7 @@ mod tests {
 
         server.clients.insert(1, alice);
 
-        let mut channel = Channel::new("#rust".to_string());
+        let mut channel = Channel::new("#rust");
         channel.members.insert(1);
 
         server.channels.insert("#rust".to_string(), channel);
@@ -2273,7 +2273,7 @@ mod tests {
 
         server.clients.insert(1, alice);
 
-        let mut channel = Channel::new("#rust".to_string());
+        let mut channel = Channel::new("#rust");
         channel.members.insert(1);
         channel.topic = Some("Rust programming".to_string());
 
@@ -2298,7 +2298,7 @@ mod tests {
         let mut server = Server::default();
         server.clients.insert(1, Client::new(sender.clone()));
 
-        let channel = Channel::new("#rust".to_string());
+        let channel = Channel::new("#rust");
         server.channels.insert("#rust".to_string(), channel);
 
         let server = Arc::new(RwLock::new(server));
