@@ -214,6 +214,15 @@ enum TopicResult {
         nickname: String,
         topic: Option<String>,
     },
+    NotRegistered,
+    NoSuchChannel {
+        nickname: String,
+        channel: String,
+    },
+    NotOnChannel {
+        nickname: String,
+        channel: String,
+    },
 }
 
 #[derive(Debug)]
@@ -466,12 +475,23 @@ async fn handle_list(
     let (nickname, mut entries) = {
         let server = server.read().await;
 
-        let nickname = server
+        let nickname = match server
             .clients
             .get(&client_id)
             .filter(|client| client.is_registered())
             .and_then(|client| client.nickname.clone())
-            .ok_or("Client is not registered")?;
+        {
+            Some(nickname) => nickname,
+            None => {
+                sender
+                    .send(format!(
+                        ":{SERVER_NAME} {ERR_NOTREGISTERED} * :You have not registered"
+                    ))
+                    .await?;
+
+                return Ok(());
+            }
+        };
 
         let entries: Vec<ListEntry> = match channel_name {
             Some(channel_name) => server
@@ -530,18 +550,38 @@ async fn handle_names(
     let nickname = {
         let server = server.read().await;
 
-        server
+        match server
             .clients
             .get(&client_id)
             .filter(|client| client.is_registered())
             .and_then(|client| client.nickname.clone())
-            .ok_or("Client is not registered")?
+        {
+            Some(nickname) => nickname,
+            None => {
+                drop(server);
+
+                sender
+                    .send(format!(
+                        ":{SERVER_NAME} {ERR_NOTREGISTERED} * :You have not registered"
+                    ))
+                    .await?;
+                return Ok(());
+            }
+        }
     };
 
     let mut member_nicknames: Vec<String> = {
         let server = server.read().await;
 
-        let channel = server.channels.get(channel_name).ok_or("No such channel")?;
+        let channel = match server.channels.get(channel_name) {
+            Some(channel) => channel,
+            None => {
+                drop(server);
+
+                sender.send(format!(":{SERVER_NAME} {ERR_NOSUCHCHANNEL} {nickname} {channel_name} :No such channel")).await?;
+                return Ok(());
+            }
+        };
 
         channel
             .members
@@ -773,12 +813,25 @@ async fn handle_join(
     let (nickname, senders) = {
         let mut server = server.write().await;
 
-        let nickname = server
+        let nickname = match server
             .clients
             .get(&client_id)
             .filter(|client| client.is_registered())
             .and_then(|client| client.nickname.clone())
-            .ok_or("Client is not registered")?;
+        {
+            Some(nickname) => nickname,
+            None => {
+                drop(server);
+
+                sender
+                    .send(format!(
+                        ":{SERVER_NAME} {ERR_NOTREGISTERED} * :You have not registered"
+                    ))
+                    .await?;
+
+                return Ok(());
+            }
+        };
 
         let member_ids: Vec<u64> = {
             let channel = server
@@ -1014,62 +1067,67 @@ async fn handle_topic(
         return Ok(());
     }
 
-    let result = {
+    let result: TopicResult = {
         let mut server = server.write().await;
 
-        let nickname = server
+        if let Some(nickname) = server
             .clients
             .get(&client_id)
             .filter(|client| client.is_registered())
             .and_then(|client| client.nickname.clone())
-            .ok_or("Client is not registered")?;
+        {
+            if let Some(channel) = server.channels.get(channel_name) {
+                let member_ids: Vec<ClientId> = channel.members.iter().copied().collect();
 
-        let member_ids: Vec<ClientId> = server
-            .channels
-            .get(channel_name)
-            .ok_or("No such channel")?
-            .members
-            .iter()
-            .copied()
-            .collect();
+                if member_ids.contains(&client_id) {
+                    match topic {
+                        Some(topic) => {
+                            if let Some(channel) = server.channels.get_mut(channel_name) {
+                                channel.topic = Some(topic.to_string());
+                            }
 
-        if !member_ids.contains(&client_id) {
-            return Err("Client is not on channel".into());
-        }
+                            let senders: Vec<mpsc::Sender<String>> = member_ids
+                                .iter()
+                                .filter_map(|member_id| {
+                                    server
+                                        .clients
+                                        .get(member_id)
+                                        .map(|client| client.sender.clone())
+                                })
+                                .collect();
 
-        match topic {
-            Some(topic) => {
-                if let Some(channel) = server.channels.get_mut(channel_name) {
-                    channel.topic = Some(topic.to_string());
+                            TopicResult::Changed {
+                                nickname,
+                                topic: topic.to_string(),
+                                senders,
+                            }
+                        }
+                        None => {
+                            let current_topic = server
+                                .channels
+                                .get(channel_name)
+                                .and_then(|channel| channel.topic.clone());
+
+                            TopicResult::Queried {
+                                nickname,
+                                topic: current_topic,
+                            }
+                        }
+                    }
+                } else {
+                    TopicResult::NotOnChannel {
+                        nickname,
+                        channel: channel_name.to_string(),
+                    }
                 }
-
-                let senders: Vec<mpsc::Sender<String>> = member_ids
-                    .iter()
-                    .filter_map(|member_id| {
-                        server
-                            .clients
-                            .get(member_id)
-                            .map(|client| client.sender.clone())
-                    })
-                    .collect();
-
-                TopicResult::Changed {
+            } else {
+                TopicResult::NoSuchChannel {
                     nickname,
-                    topic: topic.to_string(),
-                    senders,
+                    channel: channel_name.to_string(),
                 }
             }
-            None => {
-                let current_topic = server
-                    .channels
-                    .get(channel_name)
-                    .and_then(|channel| channel.topic.clone());
-
-                TopicResult::Queried {
-                    nickname,
-                    topic: current_topic,
-                }
-            }
+        } else {
+            TopicResult::NotRegistered
         }
     };
 
@@ -1094,6 +1152,25 @@ async fn handle_topic(
                     .await?;
             }
         }
+        TopicResult::NotRegistered => {
+            sender
+                .send(format!(
+                    ":{SERVER_NAME} {ERR_NOTREGISTERED} * :You have not registered"
+                ))
+                .await?
+        }
+        TopicResult::NoSuchChannel { nickname, channel } => {
+            sender
+                .send(format!(
+                    ":{SERVER_NAME} {ERR_NOSUCHCHANNEL} {nickname} {channel} :No such channel"
+                ))
+                .await?
+        }
+        TopicResult::NotOnChannel { nickname, channel } => sender
+            .send(format!(
+                ":{SERVER_NAME} {ERR_NOTONCHANNEL} {nickname} {channel} :You're not on that channel"
+            ))
+            .await?,
     }
 
     Ok(())
@@ -1544,6 +1621,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_returns_error_when_client_is_not_registered() {
+        let (sender, mut receiver) = mpsc::channel(1);
+
+        let mut server = Server::default();
+        server.clients.insert(1, Client::new(sender.clone()));
+
+        let server = Arc::new(RwLock::new(server));
+
+        handle_list(1, None, Arc::clone(&server), &sender)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            ":server 451 * :You have not registered"
+        );
+    }
+
+    #[tokio::test]
     async fn names_returns_channel_members() {
         let (sender1, mut receiver1) = mpsc::channel(2);
         let (sender2, _) = mpsc::channel(1);
@@ -1611,6 +1707,51 @@ mod tests {
         assert_eq!(
             receiver1.recv().await.unwrap(),
             ":server 366 alice #rust :End of /NAMES list."
+        );
+    }
+
+    #[tokio::test]
+    async fn names_returns_error_when_client_is_not_registered() {
+        let (sender, mut receiver) = mpsc::channel(1);
+
+        let mut server = Server::default();
+        server.clients.insert(1, Client::new(sender.clone()));
+
+        let channel = Channel::new("#rust".to_string());
+        server.channels.insert("#rust".to_string(), channel);
+
+        let server = Arc::new(RwLock::new(server));
+
+        handle_names(1, "#rust", Arc::clone(&server), &sender)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            ":server 451 * :You have not registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn names_returns_error_when_channel_does_not_exist() {
+        let (sender, mut receiver) = mpsc::channel(1);
+
+        let mut server = Server::default();
+
+        let mut alice = Client::new(sender.clone());
+        alice.nickname = Some("alice".to_string());
+        alice.username = Some("alice".to_string());
+
+        server.clients.insert(1, alice);
+
+        let server = Arc::new(RwLock::new(server));
+
+        let result = handle_names(1, "#unknown", Arc::clone(&server), &sender).await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            ":server 403 alice #unknown :No such channel"
         );
     }
 
@@ -1756,6 +1897,28 @@ mod tests {
             .unwrap();
 
         assert!(receiver1.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn join_returns_error_when_client_is_not_registered() {
+        let (sender, mut receiver) = mpsc::channel(1);
+
+        let mut server = Server::default();
+        server.clients.insert(1, Client::new(sender.clone()));
+
+        let channel = Channel::new("#rust".to_string());
+        server.channels.insert("#rust".to_string(), channel);
+
+        let server = Arc::new(RwLock::new(server));
+
+        handle_join(1, "#rust", Arc::clone(&server), &sender)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            ":server 451 * :You have not registered"
+        );
     }
 
     #[tokio::test]
@@ -2125,6 +2288,64 @@ mod tests {
         assert_eq!(
             receiver.recv().await.unwrap(),
             ":server 332 alice #rust :Rust programming"
+        );
+    }
+
+    #[tokio::test]
+    async fn topic_returns_error_when_client_is_not_registered() {
+        let (sender, mut receiver) = mpsc::channel(1);
+
+        let mut server = Server::default();
+        server.clients.insert(1, Client::new(sender.clone()));
+
+        let channel = Channel::new("#rust".to_string());
+        server.channels.insert("#rust".to_string(), channel);
+
+        let server = Arc::new(RwLock::new(server));
+
+        handle_topic(
+            1,
+            "#rust",
+            Some("Rust programming"),
+            Arc::clone(&server),
+            &sender,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            ":server 451 * :You have not registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn topic_returns_error_when_channel_does_not_exist() {
+        let (sender, mut receiver) = mpsc::channel(1);
+
+        let mut server = Server::default();
+
+        let mut alice = Client::new(sender.clone());
+        alice.nickname = Some("alice".to_string());
+        alice.username = Some("alice".to_string());
+
+        server.clients.insert(1, alice);
+
+        let server = Arc::new(RwLock::new(server));
+
+        let result = handle_topic(
+            1,
+            "#unknown",
+            Some("Rust programming"),
+            Arc::clone(&server),
+            &sender,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            ":server 403 alice #unknown :No such channel"
         );
     }
 }
