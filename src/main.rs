@@ -658,12 +658,15 @@ async fn handle_notice(
     let nickname = {
         let server = server.read().await;
 
-        server
+        match server
             .clients
             .get(&client_id)
             .filter(|client| client.is_registered())
             .and_then(|client| client.nickname.clone())
-            .ok_or("Client is not registered")?
+        {
+            Some(nickname) => nickname,
+            None => return Ok(()),
+        }
     };
 
     let message = format!(":{nickname} NOTICE {target} :{message}");
@@ -672,10 +675,13 @@ async fn handle_notice(
         let senders: Vec<mpsc::Sender<String>> = {
             let server = server.read().await;
 
-            let channel = server.channels.get(target).ok_or("No such channel")?;
+            let channel = match server.channels.get(target) {
+                Some(channel) => channel,
+                None => return Ok(()),
+            };
 
             if !channel.members.contains(&client_id) {
-                return Err("Client is not on channel".into());
+                return Ok(());
             }
 
             channel
@@ -697,12 +703,15 @@ async fn handle_notice(
         let target_sender = {
             let server = server.read().await;
 
-            server
+            match server
                 .clients
                 .values()
                 .find(|client| client.nickname.as_deref() == Some(target))
                 .map(|client| client.sender.clone())
-                .ok_or("No such nickname")?
+            {
+                Some(sender) => sender,
+                None => return Ok(()),
+            }
         };
 
         target_sender.send(message).await?;
@@ -1673,6 +1682,80 @@ mod tests {
             receiver2.recv().await.unwrap(),
             ":alice NOTICE #rust :hello rust"
         );
+    }
+
+    #[tokio::test]
+    async fn notice_ignores_unknown_nickname() {
+        let (sender, mut receiver) = mpsc::channel(1);
+
+        let mut server = Server::default();
+
+        let mut alice = Client::new(sender.clone());
+        alice.nickname = Some("alice".to_string());
+        alice.username = Some("alice".to_string());
+
+        server.clients.insert(1, alice);
+
+        let server = Arc::new(RwLock::new(server));
+
+        handle_notice(1, "bob", "hello bob", Arc::clone(&server))
+            .await
+            .unwrap();
+
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn notice_ignores_unknown_channel() {
+        let (sender, mut receiver) = mpsc::channel(1);
+
+        let mut server = Server::default();
+
+        let mut alice = Client::new(sender.clone());
+        alice.nickname = Some("alice".to_string());
+        alice.username = Some("alice".to_string());
+
+        server.clients.insert(1, alice);
+
+        let server = Arc::new(RwLock::new(server));
+
+        handle_notice(1, "#unknown", "hello", Arc::clone(&server))
+            .await
+            .unwrap();
+
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn notice_ignores_when_client_is_not_on_channel() {
+        let (sender1, mut receiver1) = mpsc::channel(1);
+        let (sender2, _) = mpsc::channel(1);
+
+        let mut server = Server::default();
+
+        let mut alice = Client::new(sender1.clone());
+        alice.nickname = Some("alice".to_string());
+        alice.username = Some("alice".to_string());
+
+        let mut bob = Client::new(sender2);
+        bob.nickname = Some("bob".to_string());
+        bob.username = Some("bob".to_string());
+
+        server.clients.insert(1, alice);
+        server.clients.insert(2, bob);
+
+        let mut channel = Channel::new("#rust".to_string());
+        channel.members.insert(2);
+
+        server.channels.insert("#rust".to_string(), channel);
+
+        let server = Arc::new(RwLock::new(server));
+
+        handle_notice(1, "#rust", "hello", Arc::clone(&server))
+            .await
+            .unwrap();
+
+        assert!(receiver1.try_recv().is_err());
     }
 
     #[tokio::test]
