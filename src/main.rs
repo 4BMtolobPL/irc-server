@@ -28,7 +28,7 @@ const ERR_NOSUCHCHANNEL: &str = "403";
 // const ERR_TOOMANYCHANNELS: &str = "405";
 const ERR_NOTONCHANNEL: &str = "442";
 const ERR_NOTREGISTERED: &str = "451";
-// const ERR_NEEDMOREPARAMS: &str = "461";
+const ERR_NEEDMOREPARAMS: &str = "461";
 // const ERR_CHANNELISFULL: &str = "471";
 // const ERR_INVITEONLYCHAN: &str = "473";
 // const ERR_BANNEDFROMCHAN: &str = "474";
@@ -155,6 +155,7 @@ enum Command {
         channel: String,
         topic: Option<String>,
     },
+    NeedMoreParams(String),
     Unknown(String),
 }
 
@@ -239,7 +240,7 @@ struct ListEntry {
 }
 
 fn parse_command(line: &str) -> Command {
-    let mut parts = line.splitn(2, ' ');
+    let mut parts = line.splitn(2, char::is_whitespace);
 
     let command = parts.next().unwrap_or("").to_uppercase();
     let rest = parts.next().unwrap_or("").trim();
@@ -252,61 +253,96 @@ fn parse_command(line: &str) -> Command {
                 Command::List(Some(rest.to_string()))
             }
         }
-        "NAMES" => Command::Names(rest.to_string()),
-        "NICK" => Command::Nick(rest.to_string()),
+        "NAMES" => {
+            if rest.is_empty() {
+                Command::NeedMoreParams("NAMES".to_string())
+            } else {
+                Command::Names(rest.to_string())
+            }
+        }
+        "NICK" => {
+            if rest.is_empty() {
+                Command::NeedMoreParams("NICK".to_string())
+            } else {
+                Command::Nick(rest.to_string())
+            }
+        }
         "NOTICE" => {
-            let mut parts = rest.splitn(2, ' ');
+            let mut parts = rest.splitn(2, char::is_whitespace);
 
-            let target = parts.next().unwrap_or("").to_string();
+            let target = parts.next().unwrap_or("");
 
-            let message = parts
-                .next()
-                .unwrap_or("")
-                .trim_start_matches(':')
-                .to_string();
+            if target.is_empty() {
+                Command::NeedMoreParams("NOTICE".to_string())
+            } else {
+                let message = parts
+                    .next()
+                    .unwrap_or("")
+                    .trim_start_matches(':')
+                    .to_string();
 
-            Command::Notice { target, message }
+                Command::Notice {
+                    target: target.to_string(),
+                    message,
+                }
+            }
         }
         "USER" => {
-            let mut parts = rest.splitn(4, ' ');
+            let mut parts = rest.splitn(4, char::is_whitespace);
 
-            let username = parts.next().unwrap_or("").to_string();
+            let username = parts.next().unwrap_or("");
+            let hostname = parts.next().unwrap_or("");
+            let servername = parts.next().unwrap_or("");
+            let realname = parts.next().unwrap_or("");
 
-            // hostname
-            let _ = parts.next();
-
-            // servername
-            let _ = parts.next();
-
-            let realname = parts
-                .next()
-                .unwrap_or("")
-                .trim_start_matches(':')
-                .to_string();
-
-            Command::User { username, realname }
+            if username.is_empty()
+                || hostname.is_empty()
+                || servername.is_empty()
+                || realname.is_empty()
+            {
+                Command::NeedMoreParams("USER".to_string())
+            } else {
+                Command::User {
+                    username: username.to_string(),
+                    realname: realname.trim_start_matches(':').to_string(),
+                }
+            }
         }
-        "JOIN" => Command::Join(rest.to_string()),
-        "PART" => Command::Part(rest.to_string()),
+        "JOIN" => {
+            if rest.is_empty() {
+                Command::NeedMoreParams("JOIN".to_string())
+            } else {
+                Command::Join(rest.to_string())
+            }
+        }
+        "PART" => {
+            if rest.is_empty() {
+                Command::NeedMoreParams("PART".to_string())
+            } else {
+                Command::Part(rest.to_string())
+            }
+        }
         "PRIVMSG" => {
-            let mut parts = rest.splitn(2, ' ');
+            let mut parts = rest.splitn(2, char::is_whitespace);
 
-            let target = parts.next().unwrap_or("").to_string();
+            let target = parts.next().unwrap_or("");
+            let message = parts.next().unwrap_or("");
 
-            let message = parts
-                .next()
-                .unwrap_or("")
-                .trim_start_matches(':')
-                .to_string();
-
-            Command::Privmsg { target, message }
+            if target.is_empty() || message.is_empty() {
+                Command::NeedMoreParams("PRIVMSG".to_string())
+            } else {
+                Command::Privmsg {
+                    target: target.to_string(),
+                    message: message.trim_start_matches(':').to_string(),
+                }
+            }
         }
         "PING" => Command::Ping(rest.trim_start_matches(':').to_string()),
         "PONG" => Command::Pong(rest.trim_start_matches(':').to_string()),
         "QUIT" => Command::Quit,
         "TOPIC" => match parse_topic(rest) {
             Some((channel, topic)) => Command::Topic { channel, topic },
-            None => Command::Unknown(line.to_string()),
+            None => Command::NeedMoreParams("TOPIC".to_string()),
         },
         _ => Command::Unknown(line.to_string()),
     }
@@ -459,6 +495,19 @@ async fn handle_command(
         Command::Quit => return Ok(false),
         Command::Topic { channel, topic } => {
             handle_topic(client_id, &channel, topic.as_deref(), server, sender).await?
+        }
+        Command::NeedMoreParams(command) => {
+            let nickname = {
+                let server = server.read().await;
+
+                server
+                    .clients
+                    .get(&client_id)
+                    .and_then(|client| client.nickname.clone())
+                    .unwrap_or_else(|| "*".to_string())
+            };
+
+            sender.send(format!(":{SERVER_NAME} {ERR_NEEDMOREPARAMS} {nickname} {command} :Not enough parameters")).await?;
         }
         Command::Unknown(command) => println!("[{client_id}] Unknown command: {command}"),
     }
@@ -1239,10 +1288,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_names_requires_parameter() {
+        let command = parse_command("NAMES");
+
+        assert_matches!(command, Command::NeedMoreParams(command) if command == "NAMES");
+    }
+
+    #[test]
     fn parse_nick() {
         let command = parse_command("NICK alice");
 
         assert_matches!(command, Command::Nick(nickname) if nickname == "alice");
+    }
+
+    #[test]
+    fn parse_nick_requires_parameter() {
+        let command = parse_command("NICK");
+
+        assert_matches!(command, Command::NeedMoreParams(command) if command == "NICK");
     }
 
     #[test]
@@ -1253,6 +1316,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_notice_requires_target() {
+        let command = parse_command("NOTICE");
+
+        assert_matches!(command, Command::NeedMoreParams(command) if command == "NOTICE");
+    }
+
+    #[test]
     fn parse_user() {
         let command = parse_command("USER alice 0 * :Alice Smith");
 
@@ -1260,10 +1330,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_user_requires_parameters() {
+        let command = parse_command("USER alice");
+
+        assert_matches!(command, Command::NeedMoreParams(command) if command == "USER");
+    }
+
+    #[test]
     fn parse_join() {
         let command = parse_command("JOIN #rust");
 
         assert_matches!(command, Command::Join(channel) if channel == "#rust");
+    }
+
+    #[test]
+    fn parse_join_requires_parameter() {
+        let command = parse_command("JOIN");
+
+        assert_matches!(command, Command::NeedMoreParams(command) if command == "JOIN");
     }
 
     #[test]
@@ -1288,10 +1372,31 @@ mod tests {
     }
 
     #[test]
+    fn parse_privmsg_requires_target_and_message() {
+        let command = parse_command("PRIVMSG");
+
+        assert_matches!(command, Command::NeedMoreParams(command) if command == "PRIVMSG");
+    }
+
+    #[test]
+    fn parse_privmsg_requires_message() {
+        let command = parse_command("PRIVMSG #rust");
+
+        assert_matches!(command, Command::NeedMoreParams(command) if command == "PRIVMSG");
+    }
+
+    #[test]
     fn parse_part() {
         let command = parse_command("PART #rust");
 
         assert_matches!(command, Command::Part(channel) if channel == "#rust");
+    }
+
+    #[test]
+    fn parse_part_requires_parameter() {
+        let command = parse_command("PART");
+
+        assert_matches!(command, Command::NeedMoreParams(command) if command == "PART");
     }
 
     #[test]
@@ -1316,10 +1421,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_topic_requires_channel() {
+        let command = parse_command("TOPIC");
+
+        assert_matches!(command, Command::NeedMoreParams(command) if command == "TOPIC");
+    }
+
+    #[test]
     fn parse_command_is_case_insensitive() {
         let command = parse_command("ping :12345");
 
         assert_matches!(command, Command::Ping(token) if token == "12345");
+    }
+
+    #[test]
+    fn parse_command_accepts_whitespace_separator() {
+        let command = parse_command("NICK\talice");
+
+        assert_matches!(command, Command::Nick(nickname) if nickname == "alice");
     }
 
     #[test]
