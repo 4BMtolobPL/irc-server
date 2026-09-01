@@ -6,10 +6,10 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
-    sync::{RwLock, mpsc},
+    sync::{RwLock, mpsc, watch},
 };
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type ClientId = u64;
 
 const RPL_WELCOME: &str = "001";
@@ -364,32 +364,56 @@ fn parse_topic(rest: &str) -> Option<(String, Option<String>)> {
     Some((channel.to_string(), topic))
 }
 
-pub async fn run_server(listener: TcpListener) -> Result<()> {
+pub async fn run_server(listener: TcpListener, mut shutdown: watch::Receiver<bool>) -> Result<()> {
     let server = Arc::new(RwLock::new(Server::default()));
     let mut next_client_id: ClientId = 1;
+    let mut client_tasks = Vec::new();
 
     loop {
-        let (stream, addr) = listener.accept().await?;
+        tokio::select! {
+            result = listener.accept() => {
+                let (stream, addr) = result?;
 
-        let client_id = next_client_id;
-        next_client_id += 1;
+                let client_id = next_client_id;
+                next_client_id += 1;
 
-        println!("Client {client_id} connected: {addr}");
+                println!("Client {client_id} connected: {addr}");
 
-        let server = Arc::clone(&server);
+                let server = Arc::clone(&server);
 
-        tokio::spawn(async move {
-            if let Err(err) = handle_client(stream, client_id, server).await {
-                eprintln!("Client {client_id} error: {err}");
+                let client_shutdown = shutdown.clone();
+
+                let task = tokio::spawn(async move {
+                    if let Err(err) = handle_client(stream, client_id, server, client_shutdown).await {
+                        eprintln!("Client {client_id} error: {err}");
+                    }
+                });
+
+                client_tasks.push(task);
+            },
+            result = shutdown.changed() => {
+                result?;
+
+                if *shutdown.borrow() {
+                    break;
+                }
             }
-        });
+        }
     }
+
+    for task in client_tasks {
+        task.await
+            .map_err(|err| format!("Client task failed: {err}"))?;
+    }
+
+    Ok(())
 }
 
 async fn handle_client(
     stream: TcpStream,
     client_id: ClientId,
     server: Arc<RwLock<Server>>,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
 
@@ -404,21 +428,41 @@ async fn handle_client(
     }
 
     let read_task = async {
-        let reader = BufReader::new(reader);
-        let mut lines = reader.lines();
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
 
-        while let Some(line) = lines.next_line().await? {
-            let command = parse_command(&line);
+        loop {
+            tokio::select! {
+                result = reader.read_line(&mut line) => {
+                    let bytes_read = result?;
 
-            let should_continue =
-                handle_command(command, client_id, Arc::clone(&server), &sender).await?;
+                    if bytes_read == 0 {
+                        break;
+                    }
 
-            if !should_continue {
-                break;
+                    let command = parse_command(&line);
+
+                    let should_continue =
+                        handle_command(command, client_id, Arc::clone(&server), &sender).await?;
+
+                    line.clear();
+
+                    if !should_continue {
+                        break;
+                    }
+                }
+
+                result = shutdown.changed() => {
+                    result?;
+
+                    if *shutdown.borrow() {
+                        break;
+                    }
+                }
             }
         }
 
-        Ok::<(), Box<dyn std::error::Error>>(())
+        Result::Ok(())
     };
 
     let write_task = async {
@@ -427,7 +471,7 @@ async fn handle_client(
             writer.write_all(b"\r\n").await?;
         }
 
-        Ok::<(), Box<dyn std::error::Error>>(())
+        Result::Ok(())
     };
 
     tokio::select! {

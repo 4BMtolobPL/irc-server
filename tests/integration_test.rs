@@ -3,6 +3,7 @@ use std::time::Duration;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
+    sync::watch,
 };
 
 #[tokio::test]
@@ -10,8 +11,12 @@ async fn registration_sends_welcome() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    tokio::spawn(async move {
-        kirc_server::run_server(listener).await.unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let server_task = tokio::spawn(async move {
+        kirc_server::run_server(listener, shutdown_rx)
+            .await
+            .unwrap();
     });
 
     let stream = TcpStream::connect(addr).await.unwrap();
@@ -35,6 +40,9 @@ async fn registration_sends_welcome() {
         buf.trim_end(),
         ":server 001 alice :Welcome to the IRC server"
     );
+
+    shutdown_tx.send(true).unwrap();
+    server_task.await.unwrap();
 }
 
 #[tokio::test]
@@ -42,8 +50,12 @@ async fn clients_can_join_channel_and_exchange_messages() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    tokio::spawn(async move {
-        kirc_server::run_server(listener).await.unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let server_task = tokio::spawn(async move {
+        kirc_server::run_server(listener, shutdown_rx)
+            .await
+            .unwrap();
     });
 
     let alice = TcpStream::connect(addr).await.unwrap();
@@ -143,6 +155,9 @@ async fn clients_can_join_channel_and_exchange_messages() {
         .unwrap();
 
     assert_eq!(buf.trim_end(), ":alice PRIVMSG #rust :hello bob");
+
+    shutdown_tx.send(true).unwrap();
+    server_task.await.unwrap();
 }
 
 #[tokio::test]
@@ -150,8 +165,12 @@ async fn part_and_disconnect_broadcast_to_channel_members() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    tokio::spawn(async move {
-        kirc_server::run_server(listener).await.unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let server_task = tokio::spawn(async move {
+        kirc_server::run_server(listener, shutdown_rx)
+            .await
+            .unwrap();
     });
 
     let alice = TcpStream::connect(addr).await.unwrap();
@@ -295,6 +314,9 @@ async fn part_and_disconnect_broadcast_to_channel_members() {
         .unwrap();
 
     assert_eq!(bob_buf.trim_end(), ":alice QUIT :Client Quit");
+
+    shutdown_tx.send(true).unwrap();
+    server_task.await.unwrap();
 }
 
 #[tokio::test]
@@ -302,8 +324,12 @@ async fn missing_parameters_return_need_more_params() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    tokio::spawn(async move {
-        kirc_server::run_server(listener).await.unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let server_task = tokio::spawn(async move {
+        kirc_server::run_server(listener, shutdown_rx)
+            .await
+            .unwrap();
     });
 
     let stream = TcpStream::connect(addr).await.unwrap();
@@ -321,6 +347,9 @@ async fn missing_parameters_return_need_more_params() {
         .unwrap();
 
     assert_eq!(buf.trim_end(), ":server 461 * NICK :Not enough parameters");
+
+    shutdown_tx.send(true).unwrap();
+    server_task.await.unwrap();
 }
 
 #[tokio::test]
@@ -328,8 +357,12 @@ async fn clients_can_send_private_messages() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    tokio::spawn(async move {
-        kirc_server::run_server(listener).await.unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let server_task = tokio::spawn(async move {
+        kirc_server::run_server(listener, shutdown_rx)
+            .await
+            .unwrap();
     });
 
     let alice = TcpStream::connect(addr).await.unwrap();
@@ -387,4 +420,86 @@ async fn clients_can_send_private_messages() {
         .unwrap();
 
     assert_eq!(buf.trim_end(), ":alice PRIVMSG bob :hello privately");
+
+    shutdown_tx.send(true).unwrap();
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn server_shutdown_waits_for_client_tasks() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let server_task = tokio::spawn(async move {
+        kirc_server::run_server(listener, shutdown_rx)
+            .await
+            .unwrap();
+    });
+
+    let client = TcpStream::connect(addr).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    shutdown_tx.send(true).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(1), server_task)
+        .await
+        .expect("Server did not shutdown")
+        .unwrap();
+
+    drop(client);
+}
+
+#[tokio::test]
+async fn server_shuts_down_with_connected_client() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let server_task = tokio::spawn(async move {
+        kirc_server::run_server(listener, shutdown_rx)
+            .await
+            .unwrap();
+    });
+
+    let _client = TcpStream::connect(addr).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    shutdown_tx.send(true).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(1), server_task)
+        .await
+        .expect("Server did not shutdown")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn server_shuts_down_with_multiple_connected_clients() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let server_task = tokio::spawn(async move {
+        kirc_server::run_server(listener, shutdown_rx)
+            .await
+            .unwrap();
+    });
+
+    let _client1 = TcpStream::connect(addr).await.unwrap();
+    let _client2 = TcpStream::connect(addr).await.unwrap();
+    let _client3 = TcpStream::connect(addr).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    shutdown_tx.send(true).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(1), server_task)
+        .await
+        .expect("Server did not shutdown")
+        .unwrap();
 }
