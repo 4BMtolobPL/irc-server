@@ -8,6 +8,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::{RwLock, mpsc, watch},
 };
+use tracing::{debug, error, info};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type ClientId = u64;
@@ -377,7 +378,7 @@ pub async fn run_server(listener: TcpListener, mut shutdown: watch::Receiver<boo
                 let client_id = next_client_id;
                 next_client_id += 1;
 
-                println!("Client {client_id} connected: {addr}");
+                info!(%client_id, %addr, "Client connected");
 
                 let server = Arc::clone(&server);
 
@@ -385,7 +386,7 @@ pub async fn run_server(listener: TcpListener, mut shutdown: watch::Receiver<boo
 
                 let task = tokio::spawn(async move {
                     if let Err(err) = handle_client(stream, client_id, server, client_shutdown).await {
-                        eprintln!("Client {client_id} error: {err}");
+                        error!(%client_id, error = %err, "Client error");
                     }
                 });
 
@@ -498,7 +499,7 @@ async fn handle_client(
         }
     }
 
-    println!("Client {client_id} disconnected");
+    info!(%client_id, "Client disconnected");
 
     Ok(())
 }
@@ -527,7 +528,7 @@ async fn handle_command(
             handle_privmsg(client_id, &target, &message, server, sender).await?
         }
         Command::Ping(token) => sender.send(format!("PONG :{token}")).await?,
-        Command::Pong(token) => println!("[{client_id}] PONG {token}"),
+        Command::Pong(token) => debug!(%client_id, %token, "PONG received"),
         Command::Quit => return Ok(false),
         Command::Topic { channel, topic } => {
             handle_topic(client_id, &channel, topic.as_deref(), server, sender).await?
@@ -545,7 +546,7 @@ async fn handle_command(
 
             sender.send(format!(":{SERVER_NAME} {ERR_NEEDMOREPARAMS} {nickname} {command} :Not enough parameters")).await?;
         }
-        Command::Unknown(command) => println!("[{client_id}] Unknown command: {command}"),
+        Command::Unknown(command) => debug!(%client_id, %command, "Unknown command"),
     }
 
     Ok(true)

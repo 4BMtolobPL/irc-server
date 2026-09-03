@@ -1,11 +1,20 @@
 use tokio::{signal, sync::watch};
+use tracing::info;
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("kirc_server=info")),
+        )
+        .init();
+
     let listen_addr = "0.0.0.0:6667";
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
 
-    println!("IRC server listening on {listen_addr}");
+    info!(%listen_addr, "IRC server listening");
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -13,12 +22,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     signal::ctrl_c().await?;
 
-    println!("Shutdown signal received");
+    info!("Shutdown signal received");
 
     shutdown_tx.send(true)?;
     server_task.await??;
 
-    println!("IRC server stopped");
+    info!("IRC server stopped");
 
     Ok(())
 }
