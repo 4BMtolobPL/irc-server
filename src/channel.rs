@@ -18,3 +18,15 @@ impl Channel {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_channel_has_no_topic() {
+        let channel = Channel::new("#rust");
+
+        assert_eq!(channel.topic, None);
+    }
+}
