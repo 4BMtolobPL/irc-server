@@ -1,4 +1,5 @@
 mod channel;
+mod client;
 mod command;
 
 use std::{
@@ -15,6 +16,7 @@ use tracing::{debug, error, info};
 
 use crate::{
     channel::Channel,
+    client::Client,
     command::{Command, parse_command},
 };
 
@@ -94,30 +96,6 @@ impl Server {
             .retain(|_, channel| !channel.members.is_empty());
 
         DisconnectResult { nickname, senders }
-    }
-}
-
-#[derive(Debug)]
-struct Client {
-    nickname: Option<String>,
-    username: Option<String>,
-    realname: Option<String>,
-    sender: mpsc::Sender<String>,
-}
-
-impl Client {
-    fn new(sender: mpsc::Sender<String>) -> Self {
-        Self {
-            nickname: None,
-            username: None,
-            realname: None,
-            sender,
-        }
-    }
-
-    /// NICK + USER -> registration
-    fn is_registered(&self) -> bool {
-        self.nickname.is_some() && self.username.is_some()
     }
 }
 
