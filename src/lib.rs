@@ -1,3 +1,4 @@
+mod channel;
 mod command;
 
 use std::{
@@ -12,7 +13,10 @@ use tokio::{
 };
 use tracing::{debug, error, info};
 
-use crate::command::{Command, parse_command};
+use crate::{
+    channel::Channel,
+    command::{Command, parse_command},
+};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type ClientId = u64;
@@ -114,23 +118,6 @@ impl Client {
     /// NICK + USER -> registration
     fn is_registered(&self) -> bool {
         self.nickname.is_some() && self.username.is_some()
-    }
-}
-
-#[derive(Debug)]
-struct Channel {
-    name: String,
-    topic: Option<String>,
-    members: HashSet<ClientId>,
-}
-
-impl Channel {
-    fn new(name: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            topic: None,
-            members: HashSet::new(),
-        }
     }
 }
 
